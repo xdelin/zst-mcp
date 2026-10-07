@@ -1,0 +1,7 @@
+mcp
+httpx
+python-dotenv
+python-pptx
+pymupdf
+pywin32
+python-docx
