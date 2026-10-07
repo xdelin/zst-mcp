@@ -1,0 +1,20 @@
+# secrets
+.env
+.env.*
+!.env.example
+credentials.json
+
+# runtime data（服务器上含真实用户数据）
+data/
+logs/
+*.log
+
+# deps & caches
+node_modules/
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# OS
+.DS_Store
