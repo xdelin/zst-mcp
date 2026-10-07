@@ -1,0 +1,42 @@
+diff --git a/dify-agent/tests/local/dify_agent/layers/dify_plugin/test_layers.py b/dify-agent/tests/local/dify_agent/layers/dify_plugin/test_layers.py
+index a47efd754..f1e0e18f0 100644
+--- a/dify-agent/tests/local/dify_agent/layers/dify_plugin/test_layers.py
++++ b/dify-agent/tests/local/dify_agent/layers/dify_plugin/test_layers.py
+@@ -244,6 +244,24 @@ def _tool_transport(
+             }
+             return _invoke_stream_response(error_payload=invoke_error_payload, chunked_blob=chunked_blob)
+ 
++        # BLOB 工具返回的上传链路：inner upload-request → for-plugin 上传落 tool_file。
++        if request.url.path.endswith("/inner/api/agent/files/upload-request"):
++            payload = json.loads(request.content.decode("utf-8"))
++            assert payload["user_id"] == "user-1"
++            assert payload["tenant_id"] == "tenant-1"
++            assert payload["filename"]
++            return httpx.Response(
++                200, json={"code": 0, "upload_uri": "/files/upload/for-plugin?sign=abc"}
++            )
++        if request.url.path.startswith("/files/upload/for-plugin"):
++            return httpx.Response(
++                201,
++                json={
++                    "name": "map.png",
++                    "preview_url": "http://files.example/files/tools/tf-1.png?sign=abc",
++                },
++            )
++
+         raise AssertionError(f"Unexpected request path: {request.url.path}")
+ 
+     return httpx.MockTransport(handler)
+@@ -1041,7 +1059,11 @@ def test_dify_plugin_tools_layer_merges_blob_chunks_before_observation_conversio
+                     None,  # pyright: ignore[reportArgumentType]
+                 )
+ 
+-                assert "hello world" in result
++                assert "hello world" not in result
+                 assert "sequence=0" not in result
++                # BLOB 被上传为 tool_file，observation 只带相对 URL（供模型在回答中
++                # 用 markdown 图片语法转述给用户），绝不携带字节 repr。
++                assert "/files/tools/tf-1.png?sign=abc" in result
++                assert "map.png" in result
+ 
+     asyncio.run(scenario())

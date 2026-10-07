@@ -1,0 +1,13 @@
+diff --git a/docker/docker-compose.yaml b/docker/docker-compose.yaml
+index aea50d76f..9a8624566 100644
+--- a/docker/docker-compose.yaml
++++ b/docker/docker-compose.yaml
+@@ -608,6 +608,8 @@ services:
+       PLUGIN_STDIO_BUFFER_SIZE: ${PLUGIN_STDIO_BUFFER_SIZE:-1024}
+       PLUGIN_STDIO_MAX_BUFFER_SIZE: ${PLUGIN_STDIO_MAX_BUFFER_SIZE:-5242880}
+       PIP_MIRROR_URL: ${PIP_MIRROR_URL:-}
++      PIP_INDEX_URL: ${PIP_INDEX_URL:-}
++      PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-}
+       PLUGIN_STORAGE_TYPE: ${PLUGIN_STORAGE_TYPE:-local}
+       PLUGIN_STORAGE_LOCAL_ROOT: ${PLUGIN_STORAGE_LOCAL_ROOT:-/app/storage}
+       PLUGIN_INSTALLED_PATH: ${PLUGIN_INSTALLED_PATH:-plugin}

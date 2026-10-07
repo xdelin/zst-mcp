@@ -1,0 +1,128 @@
+diff --git a/api/core/workflow/nodes/agent/runtime_support.py b/api/core/workflow/nodes/agent/runtime_support.py
+index 6ffccd707..b57c04392 100644
+--- a/api/core/workflow/nodes/agent/runtime_support.py
++++ b/api/core/workflow/nodes/agent/runtime_support.py
+@@ -1,6 +1,12 @@
+ from __future__ import annotations
+ 
++import base64
++import hashlib
++import hmac
+ import json
++import logging
++import os
++import time
+ from collections.abc import Sequence
+ from typing import Any, cast
+ 
+@@ -9,6 +15,7 @@ from pydantic import ValidationError
+ from sqlalchemy import select
+ from sqlalchemy.orm import Session
+ 
++from configs import dify_config
+ from core.agent.entities import AgentToolEntity
+ from core.agent.plugin_entities import AgentStrategyParameter
+ from core.memory.token_buffer_memory import TokenBufferMemory
+@@ -17,8 +24,10 @@ from core.plugin.entities.request import InvokeCredentials
+ from core.plugin.impl.model_runtime_factory import create_plugin_model_assembly
+ from core.tools.entities.tool_entities import ToolIdentity, ToolParameter, ToolProviderType
+ from core.tools.tool_manager import ToolManager
+-from core.workflow.system_variables import SystemVariableKey, get_system_text
++from core.workflow.file_reference import parse_file_reference
++from core.workflow.system_variables import SystemVariableKey, get_system_text, get_system_value
+ from extensions.ext_database import db
++from graphon.file import FileTransferMethod
+ from graphon.model_runtime.entities.model_entities import AIModelEntity, ModelType
+ from graphon.runtime import VariablePool
+ from graphon.variables.template_resolution import convert_template
+@@ -28,6 +37,8 @@ from .entities import AgentNodeData, AgentOldVersionModelFeatures, ParamsAutoGen
+ from .exceptions import AgentInputTypeError, AgentVariableNotFoundError
+ from .strategy_protocols import ResolvedAgentStrategy
+ 
++logger = logging.getLogger(__name__)
++
+ 
+ class AgentRuntimeSupport:
+     def build_parameters(
+@@ -218,8 +229,81 @@ class AgentRuntimeSupport:
+                             value["completion_params"] = {}
+             result[parameter_name] = value
+ 
++        # ---- 本地补丁：为 agent 节点注入用户上传文件的长效下载 URL ----
++        if isinstance(result.get("query"), str):
++            result["query"] = self._append_uploaded_file_urls(
++                variable_pool=variable_pool, query=result["query"]
++            )
++
+         return result
+ 
++    # ---- 本地补丁：为 agent 节点注入用户上传文件的长效下载 URL ----
++    def _append_uploaded_file_urls(self, *, variable_pool: VariablePool, query: str) -> str:
++        """把 sys.files 中用户上传文件的下载 URL 追加到 query 末尾。
++
++        背景：function-calling agent 只能看到 query 文本，用户随消息上传的文件
++        不会出现在模型上下文里，模型因此无法把文件传给需要路径/URL 的 MCP 工具
++        （如 ppt-judge 的 evaluate_file、skillsmcp 的 read_document）。这里为每个
++        LOCAL_FILE 文件生成 /files/<id>/file-preview 签名 URL（有效期
++        FILES_ACCESS_TIMEOUT，部署侧已调大到 7 天），REMOTE_URL 文件原样透传；
++        MCP 服务端可直接 GET 下载（ppt-judge 的 download_to_temp 会自动拼接
++        DIFY_BASE_URL，此处直接给绝对 URL 亦可）。
++        """
++        try:
++            files = get_system_value(variable_pool, SystemVariableKey.FILES) or []
++        except Exception:
++            logger.exception("[file-url-inject] failed to read sys.files")
++            return query
++        logger.info("[file-url-inject] sys.files count=%d", len(files))
++        lines: list[str] = []
++        for file in files:
++            try:
++                url = self._resolve_user_file_url(file)
++            except Exception:
++                logger.exception("[file-url-inject] failed to resolve file url for %r", file)
++                continue
++            if not url:
++                continue
++            name = getattr(file, "filename", None) or "file"
++            lines.append(f"- {name}: {url}")
++        if not lines:
++            return query
++        block = "\n\n[用户上传的文件] 以下 URL 可直接作为工具的文件路径/URL 参数使用：\n" + "\n".join(lines)
++        return query + block
++
++    @staticmethod
++    def _resolve_user_file_url(file: Any) -> str | None:
++        """Resolve a download URL for a user-uploaded file in sys.files.
++
++        Mirrors DifyWorkflowFileRuntime.resolve_upload_file_uri / verify_preview_signature:
++        HMAC-SHA256 over ``file-preview|{id}|{timestamp}|{nonce}`` with SECRET_KEY,
++        served unauthenticated by /files/<id>/file-preview.
++        """
++        transfer_method = getattr(file, "transfer_method", None)
++        if transfer_method == FileTransferMethod.REMOTE_URL:
++            return getattr(file, "remote_url", None)
++        if transfer_method != FileTransferMethod.LOCAL_FILE:
++            return None
++        upload_file_id = getattr(file, "upload_file_id", None)
++        if not upload_file_id:
++            parsed = parse_file_reference(getattr(file, "reference", None))
++            if parsed is None:
++                return None
++            upload_file_id = parsed.record_id
++        timestamp = str(int(time.time()))
++        nonce = os.urandom(16).hex()
++        payload = f"file-preview|{upload_file_id}|{timestamp}|{nonce}"
++        sign = base64.urlsafe_b64encode(
++            hmac.new(dify_config.SECRET_KEY.encode(), payload.encode(), hashlib.sha256).digest()
++        ).decode()
++        base_url = (dify_config.FILES_URL or "").rstrip("/")
++        # as_attachment 让响应带 Content-Disposition 文件名，下载方（如 ppt-judge）
++        # 才能从 URL 无扩展名的 /file-preview 路由里还原出真实文件名和扩展名。
++        return (
++            f"{base_url}/files/{upload_file_id}/file-preview"
++            f"?timestamp={timestamp}&nonce={nonce}&sign={sign}&as_attachment=true"
++        )
++
+     def build_credentials(self, *, parameters: dict[str, Any]) -> InvokeCredentials:
+         credentials = InvokeCredentials()
+         credentials.tool_credentials = {}

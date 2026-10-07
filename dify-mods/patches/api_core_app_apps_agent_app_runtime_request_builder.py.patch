@@ -1,0 +1,68 @@
+diff --git a/api/core/app/apps/agent_app/runtime_request_builder.py b/api/core/app/apps/agent_app/runtime_request_builder.py
+index 23b93d2f9..ccd6b3baa 100644
+--- a/api/core/app/apps/agent_app/runtime_request_builder.py
++++ b/api/core/app/apps/agent_app/runtime_request_builder.py
+@@ -10,6 +10,7 @@ used by workflow runs.
+ 
+ from __future__ import annotations
+ 
++import logging
+ from dataclasses import dataclass
+ from typing import Any, Literal, cast
+ 
+@@ -28,7 +29,7 @@ from clients.agent_backend import (
+     redact_for_agent_backend_log,
+ )
+ from configs import dify_config
+-from core.app.entities.app_invoke_entities import DifyRunContext, InvokeFrom
++from core.app.entities.app_invoke_entities import DifyRunContext, InvokeFrom, UserFrom
+ from core.app.llm.model_access import resolve_model_context_window
+ from core.plugin.provider_identity import normalize_plugin_daemon_provider_identity
+ from core.workflow.nodes.agent_v2.dify_tools_builder import (
+@@ -50,6 +51,8 @@ from models.agent_config_entities import AgentSoulConfig, AgentSoulToolsConfig
+ from models.provider_ids import ModelProviderID
+ from services.agent.prompt_mentions import expand_prompt_mentions
+ 
++logger = logging.getLogger(__name__)
++
+ 
+ class AgentAppRuntimeRequestBuildError(ValueError):
+     """Raised when Agent App state cannot be mapped to a valid run request."""
+@@ -149,6 +152,27 @@ class AgentAppRuntimeRequestBuilder:
+             agent_soul.model.plugin_id,
+         )
+ 
++        # 本地补丁（usermem 用户级记忆）：把当前 end-user 的稳定标识（session_id，
++        # 即 service API 的 user 参数 / CAS 用户名）与当前会话 id 注入系统提示词
++        # 末尾，agent 侧的 usermem MCP 工具据此传正确的 user 参数。
++        # 通过 docker-compose.override.yaml 只读挂载持久化，升级 Dify 时需复核。
++        agent_soul_prompt = expand_prompt_mentions(agent_soul.prompt.system_prompt, soul_prompt_resolver).strip() or None
++        if agent_soul_prompt and context.dify_context.user_from == UserFrom.END_USER:
++            try:
++                from core.db.session_factory import session_factory
++                from models.model import EndUser
++
++                with session_factory.create_session() as _session:
++                    _end_user = _session.get(EndUser, context.dify_context.user_id)
++                    _session_id = _end_user.session_id if _end_user else None
++                if _session_id:
++                    agent_soul_prompt += (
++                        f"\n\n[用户上下文] 用户标识:{_session_id}；会话:{context.conversation_id}"
++                        "（usermem 记忆工具的 user 参数必须使用该用户标识）"
++                    )
++            except Exception:
++                logger.warning("usermem identity injection failed", exc_info=True)
++
+         request = self._request_builder.build_for_agent_app(
+             AgentBackendAgentAppRunInput(
+                 model=AgentBackendModelConfig(
+@@ -174,8 +198,7 @@ class AgentAppRuntimeRequestBuilder:
+                 backend_binding_ref=context.backend_binding_ref,
+                 # ENG-616: expand slash-menu mention tokens to canonical names so
+                 # no frontend-internal {{#…#}} marker ever reaches the model.
+-                agent_soul_prompt=expand_prompt_mentions(agent_soul.prompt.system_prompt, soul_prompt_resolver).strip()
+-                or None,
++                agent_soul_prompt=agent_soul_prompt,
+                 agent_config_version_kind=context.agent_config_version_kind,
+                 user_prompt=context.user_query,
+                 tools=tool_layers.plugin_tools,

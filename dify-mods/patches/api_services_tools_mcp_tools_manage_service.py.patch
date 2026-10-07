@@ -1,0 +1,57 @@
+diff --git a/api/services/tools/mcp_tools_manage_service.py b/api/services/tools/mcp_tools_manage_service.py
+index 6a2d2fea8..d7b656663 100644
+--- a/api/services/tools/mcp_tools_manage_service.py
++++ b/api/services/tools/mcp_tools_manage_service.py
+@@ -6,6 +6,7 @@ from datetime import datetime
+ from enum import StrEnum
+ from typing import Any
+ from urllib.parse import urlparse
++from uuid import UUID
+ 
+ from pydantic import BaseModel, Field
+ from sqlalchemy import or_, select
+@@ -27,6 +28,15 @@ from services.tools.tools_transform_service import ToolTransformService
+ 
+ logger = logging.getLogger(__name__)
+ 
++
++def _is_valid_uuid(value: str) -> bool:
++    try:
++        UUID(value)
++        return True
++    except (ValueError, AttributeError):
++        return False
++
++
+ # Constants
+ UNCHANGED_SERVER_URL_PLACEHOLDER = "[__HIDDEN__]"
+ CLIENT_NAME = "Dify"
+@@ -104,10 +114,18 @@ class MCPToolManageService:
+             stmt = select(MCPToolProvider).where(
+                 MCPToolProvider.tenant_id == tenant_id, MCPToolProvider.server_identifier == server_identifier
+             )
+-        else:
++        elif _is_valid_uuid(provider_id or ""):
+             stmt = select(MCPToolProvider).where(
+                 MCPToolProvider.tenant_id == tenant_id, MCPToolProvider.id == provider_id
+             )
++        else:
++            # The /tools/mcp list endpoint reports `id` as the server_identifier,
++            # so clients round-trip that value back in /mcp/tools/<id>,
++            # /mcp/update/<id>, PUT and DELETE bodies. Accept it here instead of
++            # letting the UUID cast raise DataError.
++            stmt = select(MCPToolProvider).where(
++                MCPToolProvider.tenant_id == tenant_id, MCPToolProvider.server_identifier == (provider_id or "")
++            )
+ 
+         provider = self._session.scalar(stmt)
+         if not provider:
+@@ -213,7 +231,7 @@ class MCPToolManageService:
+             stmt = select(MCPToolProvider).where(
+                 MCPToolProvider.tenant_id == tenant_id,
+                 MCPToolProvider.name == name,
+-                MCPToolProvider.id != provider_id,
++                MCPToolProvider.id != mcp_provider.id,
+             )
+             existing_provider = self._session.scalar(stmt)
+             if existing_provider:

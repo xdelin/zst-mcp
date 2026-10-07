@@ -1,0 +1,31 @@
+diff --git a/dify-agent/src/dify_agent/runtime/run_scheduler.py b/dify-agent/src/dify_agent/runtime/run_scheduler.py
+index a0bf260bd..2511a9877 100644
+--- a/dify-agent/src/dify_agent/runtime/run_scheduler.py
++++ b/dify-agent/src/dify_agent/runtime/run_scheduler.py
+@@ -268,7 +268,25 @@ class RunScheduler:
+                             usage=runner.terminal_usage,
+                         )
+             raise
+-        except Exception:
++        except Exception as exc:
++            # 兜底：runner 正常路径会自行 emit run_failed；走到这里说明 run 是在
++            # 意外位置死掉的（或发射本身失败）。若此时 run 还没有终态事件，
++            # SSE 流就会静默结束——前端只见对话中断、没有任何错误提示。
++            # emit_run_failed 幂等（已有终态时 applied=False），补一个 failed 事件
++            # 让 Dify 侧把它转成用户可见的 error 事件。
++            try:
++                await emit_run_failed(
++                    runner.sink,
++                    run_id=record.run_id,
++                    error=str(exc) or type(exc).__name__,
++                    session_snapshot=runner.terminal_session_snapshot,
++                    usage=runner.terminal_usage,
++                )
++            except Exception:
++                logger.exception(
++                    "failed to emit run_failed after scheduled run error",
++                    extra={"run_id": record.run_id},
++                )
+             logger.exception("scheduled run failed", extra={"run_id": record.run_id})
+         finally:
+             await self._cancel_and_wait(observer_task)

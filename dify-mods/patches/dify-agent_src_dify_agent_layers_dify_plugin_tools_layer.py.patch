@@ -1,0 +1,256 @@
+diff --git a/dify-agent/src/dify_agent/layers/dify_plugin/tools_layer.py b/dify-agent/src/dify_agent/layers/dify_plugin/tools_layer.py
+index 6e43566e5..cbb234b1e 100644
+--- a/dify-agent/src/dify_agent/layers/dify_plugin/tools_layer.py
++++ b/dify-agent/src/dify_agent/layers/dify_plugin/tools_layer.py
+@@ -15,6 +15,7 @@ from __future__ import annotations
+ 
+ from copy import deepcopy
+ import json
++import logging
+ import mimetypes
+ from collections.abc import Mapping, Sequence
+ from dataclasses import dataclass, field
+@@ -57,6 +58,11 @@ _FILE_UPLOAD_END = "<<<DIFY_PLUGIN_TOOL_FILE_UPLOAD_END>>>"
+ _FILE_UPLOAD_TIMEOUT_SECONDS = 60.0
+ _SUPPORTED_REMOTE_URL_PREFIXES = ("http://", "https://")
+ 
++# 上限对齐 Dify 上传通道能力（实测思维导图 PNG 最大 ~7MB，留足余量）。
++_BLOB_UPLOAD_MAX_SIZE_BYTES = 30 * 1024 * 1024
++
++logger = logging.getLogger(__name__)
++
+ 
+ class DifyPluginToolsDeps(LayerDeps):
+     """Dependencies required by ``DifyPluginToolsLayer``."""
+@@ -85,6 +91,16 @@ class _DownloadFileResponse(BaseModel):
+     model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+ 
+ 
++@dataclass(slots=True)
++class _UploadedToolFile:
++    """A tool blob uploaded to Dify, addressable by a frontend-reachable URL."""
++
++    name: str
++    # 相对 /files/... 路径：前端走同源代理取文件，避免 https 页面混合内容拦截；
++    # 历史消息的正文 URL 也会被 API 侧 re_sign_file_url_answer 重签（支持相对形式）。
++    url: str
++
++
+ @dataclass(slots=True)
+ class _DifyPluginToolFileClient:
+     """Resolve Dify file mappings into signed URLs for plugin file parameters."""
+@@ -153,6 +169,76 @@ class _DifyPluginToolFileClient:
+         except ValidationError as exc:
+             raise DifyPluginToolClientError("Invalid Dify API file download data.") from exc
+ 
++    async def upload_tool_blob(
++        self,
++        *,
++        execution_context: DifyExecutionContextLayerConfig,
++        blob: bytes,
++        filename: str,
++        mimetype: str,
++    ) -> _UploadedToolFile | None:
++        """Upload raw tool-output bytes to Dify; return a frontend-reachable URL.
++
++        BLOB tool responses (思维导图 PNG 等插件产物) 不能字符串化进 observation：
++        多兆字节的 ``blob=b'...'`` repr 会灌爆 LLM 上下文（qwen 上限 ~98 万 token
++        输入直接 400）并污染前端思考块。这里走 Dify 的签名插件上传通道
++        （inner upload-request → for-plugin PUT）落成 tool_file，observation 只带 URL。
++        任何失败都返回 ``None``，由调用方降级为纯文字提示（绝不回退到字节 repr）。
++        """
++        if execution_context.user_id is None or execution_context.user_from is None:
++            logger.warning("tool blob upload skipped: execution context is missing user identity")
++            return None
++
++        payload = {
++            "tenant_id": execution_context.tenant_id,
++            "user_id": execution_context.user_id,
++            "user_from": execution_context.user_from,
++            "filename": filename,
++            "mimetype": mimetype,
++            "conversation_id": execution_context.conversation_id,
++            "max_size": _BLOB_UPLOAD_MAX_SIZE_BYTES,
++        }
++        try:
++            request_response = await self.http_client.post(
++                f"{self.base_url}/inner/api/agent/files/upload-request",
++                headers={"X-Inner-Api-Key": self.api_key, "Content-Type": "application/json"},
++                json=payload,
++            )
++            request_data = request_response.json() if request_response.content else None
++            if request_response.status_code >= 400 or not isinstance(request_data, dict):
++                logger.warning(
++                    "tool blob upload request rejected: HTTP %s", request_response.status_code
++                )
++                return None
++            upload_uri = request_data.get("upload_uri")
++            if not isinstance(upload_uri, str) or not upload_uri:
++                logger.warning("tool blob upload request response is missing upload_uri")
++                return None
++
++            upload_response = await self.http_client.post(
++                f"{self.base_url}{upload_uri}",
++                files={"file": (filename, blob, mimetype)},
++                follow_redirects=True,
++            )
++            upload_data = upload_response.json() if upload_response.content else None
++            if upload_response.status_code >= 400 or not isinstance(upload_data, dict):
++                logger.warning(
++                    "tool blob upload failed: HTTP %s", upload_response.status_code
++                )
++                return None
++            url = _relativize_file_url(upload_data.get("preview_url"))
++            if url is None:
++                logger.warning("tool blob upload response has no usable preview_url")
++                return None
++            uploaded_name = upload_data.get("name")
++            return _UploadedToolFile(
++                name=uploaded_name if isinstance(uploaded_name, str) and uploaded_name else filename,
++                url=url,
++            )
++        except Exception:
++            logger.warning("tool blob upload errored", exc_info=True)
++            return None
++
+ 
+ @dataclass(slots=True)
+ class DifyPluginToolsLayer(PlainLayer[DifyPluginToolsDeps, DifyPluginToolsLayerConfig]):
+@@ -274,6 +360,7 @@ def _build_pydantic_ai_tool(
+                 credentials=dict(tool_config.credentials),
+                 tool_parameters=merged_arguments,
+             )
++            messages = await _materialize_blob_messages(messages, file_context=file_context)
+             return _convert_tool_response_to_text(messages)
+         except DifyPluginToolClientError as exc:
+             return _tool_error_text(tool_name=tool_name, error=exc)
+@@ -616,7 +703,117 @@ def _parse_uploaded_file_mapping(output: str) -> dict[str, object]:
+     return {"transfer_method": "tool_file", "reference": reference}
+ 
+ 
++def _relativize_file_url(url: object) -> str | None:
++    """把绝对 http(s) 的 /files/... URL 转成相对路径；非文件 URL 返回 None。
++
++    前端对 /files/... 走同源代理（https 页面下绝对 http 源会被混合内容拦截）；
++    API 侧历史消息重签（re_sign_file_url_answer）同样支持相对形式。
++    """
++    if not isinstance(url, str) or not url:
++        return None
++    parsed = urlparse(url)
++    if parsed.scheme in {"http", "https"} and parsed.path.startswith("/files/"):
++        return f"{parsed.path}?{parsed.query}" if parsed.query else parsed.path
++    if url.startswith("/files/"):
++        return url
++    return None
++
++
++def _blob_message_parts(response: DifyPluginToolInvokeMessage) -> tuple[bytes, str, str] | None:
++    """Extract (blob, filename, mimetype) from a BLOB tool response, else None."""
++    if response.type is not DifyPluginToolInvokeMessage.MessageType.BLOB:
++        return None
++    message = response.message
++    if not isinstance(message, DifyPluginToolInvokeMessage.BlobMessage):
++        return None
++    meta = response.meta or {}
++    filename = meta.get("filename")
++    mimetype = meta.get("mime_type")
++    return (
++        message.blob,
++        filename if isinstance(filename, str) and filename else "file",
++        mimetype if isinstance(mimetype, str) and mimetype else "application/octet-stream",
++    )
++
++
++def _sniff_blob_mimetype(blob: bytes, declared: str) -> str:
++    """补齐/校正 BLOB 的 mimetype：插件 meta 缺失时按魔数识别常见图片格式。"""
++    if declared and declared != "application/octet-stream":
++        return declared
++    if blob.startswith(b"\x89PNG"):
++        return "image/png"
++    if blob.startswith(b"\xff\xd8\xff"):
++        return "image/jpeg"
++    if blob.startswith((b"GIF87a", b"GIF89a")):
++        return "image/gif"
++    return declared or "application/octet-stream"
++
++
++def _blob_fallback_filename(mimetype: str) -> str:
++    guessed = mimetypes.guess_extension(mimetype)
++    return f"file{guessed or '.bin'}"
++
++
++async def _materialize_blob_messages(
++    messages: Sequence[DifyPluginToolInvokeMessage],
++    *,
++    file_context: "_PluginToolFileContext",
++) -> list[DifyPluginToolInvokeMessage]:
++    """把 BLOB 工具返回替换成「已上传文件的 URL」文字 observation。
++
++    上传成功：observation 携带相对 URL，并提示模型在最终回答里用 markdown
++    图片语法展示（dify-agent 应用没有 message_files 通道，正文是唯一通道）。
++    上传失败：降级为固定文字（不带字节数据），模型只告知用户文件交付失败。
++    """
++    converted: list[DifyPluginToolInvokeMessage] = []
++    for response in messages:
++        parts = _blob_message_parts(response)
++        if parts is None:
++            converted.append(response)
++            continue
++
++        blob, filename, mimetype = parts
++        mimetype = _sniff_blob_mimetype(blob, mimetype)
++        if not filename or filename == "file":
++            filename = _blob_fallback_filename(mimetype)
++
++        uploaded: _UploadedToolFile | None = None
++        if len(blob) > _BLOB_UPLOAD_MAX_SIZE_BYTES:
++            logger.warning(
++                "tool blob of %d bytes exceeds upload cap; dropping delivery", len(blob)
++            )
++        else:
++            uploaded = await file_context.file_client.upload_tool_blob(
++                execution_context=file_context.execution_context,
++                blob=blob,
++                filename=filename,
++                mimetype=mimetype,
++            )
++
++        if uploaded is not None:
++            text = (
++                f"Generated file {uploaded.name} (uploaded and ready for the user): {uploaded.url}. "
++                f"Include this URL in your final reply so the user can view it "
++                f"(for images use markdown: ![{uploaded.name}]({uploaded.url})). "
++                "Do not generate the file again."
++            )
++        else:
++            text = (
++                "Generated file ... (delivery to the user failed). "
++                "Tell the user the file was produced but could not be delivered; do not retry generating it."
++            )
++        converted.append(
++            DifyPluginToolInvokeMessage(
++                type=DifyPluginToolInvokeMessage.MessageType.TEXT,
++                message=DifyPluginToolInvokeMessage.TextMessage(text=text),
++                meta=response.meta,
++            )
++        )
++    return converted
++
++
+ def _tool_error_text(*, tool_name: str, error: DifyPluginToolClientError) -> str:
++    """Map expected daemon/tool failures into agent-visible observation text."""
+     """Map expected daemon/tool failures into agent-visible observation text.
+ 
+     Only known plugin-daemon rejection categories should be softened into tool
+@@ -670,7 +867,10 @@ def _convert_tool_response_to_text(tool_response: Sequence[DifyPluginToolInvokeM
+         elif response.type is DifyPluginToolInvokeMessage.MessageType.VARIABLE:
+             continue
+         else:
+-            parts.append(str(response.message))
++            # 兜底必须截断：未经处理的载荷可能携带字节字段（如 BLOB 的 bytes），
++            # str() 生成数 MB 的 repr 会污染 observation/LLM 上下文。
++            rendered = str(response.message)
++            parts.append(rendered[:300] + "…(truncated)" if len(rendered) > 300 else rendered)
+ 
+     if json_parts:
+         existing_parts = set(parts)

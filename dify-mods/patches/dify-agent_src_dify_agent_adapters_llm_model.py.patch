@@ -1,0 +1,205 @@
+diff --git a/dify-agent/src/dify_agent/adapters/llm/model.py b/dify-agent/src/dify_agent/adapters/llm/model.py
+index 1f4c93a16..357ad5a6f 100644
+--- a/dify-agent/src/dify_agent/adapters/llm/model.py
++++ b/dify-agent/src/dify_agent/adapters/llm/model.py
+@@ -10,6 +10,7 @@ and reads that accumulated usage after all model/tool rounds finish.
+ from __future__ import annotations
+ 
+ import base64
++import logging
+ import re
+ from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
+ from contextlib import asynccontextmanager
+@@ -76,6 +77,33 @@ _THINK_START = "<think>\n"
+ _THINK_END = "\n</think>"
+ _THINK_OPEN_TAG = "<think>"
+ _THINK_CLOSE_TAG = "</think>"
++# 复读熔断阈值：同一思考句连续出现 8 次、或累计出现 24 次，判为复读退化并截断后续思考。
++_THINK_REPEAT_STREAK_LIMIT = 8
++_THINK_REPEAT_TOTAL_LIMIT = 24
++# 句子切片：遇到句号/分号/换行切一段，无分隔符时整段为一片
++_THINK_SEGMENT_RE = re.compile(r".*?[。;；\n]|.+", re.S)
++# 无句读的长切片退化为一片，句子统计拦不住——额外对切片做尾部周期性检测
++# （切片末尾由同一短单元连续重复 >= 熔断阈值次即判复读）
++_THINK_PERIODIC_MIN_LEN = 64
++_THINK_PERIODIC_MAX_UNIT = 64
++
++
++def _periodic_repeat_count(text: str) -> int:
++    best = 1
++    limit = min(_THINK_PERIODIC_MAX_UNIT, len(text) // 2)
++    for unit_len in range(1, limit + 1):
++        unit = text[-unit_len:]
++        count = 1
++        pos = len(text) - unit_len
++        while pos >= unit_len and text[pos - unit_len : pos] == unit:
++            count += 1
++            pos -= unit_len
++        if count > best:
++            best = count
++    return best
++
++
++logger = logging.getLogger(__name__)
+ _THINK_TAG_PATTERN = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+ _DETAIL_HIGH = "high"
+ 
+@@ -257,6 +285,9 @@ class DifyStreamedResponse(StreamedResponse):
+         for event in self._embedded_thinking_parser.flush(self._parts_manager, self.provider_name_value):
+             yield event
+ 
++        for event in _ensure_actionable_output(self._parts_manager, self.provider_name_value):
++            yield event
++
+     @property
+     def dify_usage(self) -> LLMUsage | None:
+         """Return Dify's complete usage for this model request."""
+@@ -706,6 +737,37 @@ def _get_detail(item: ImageUrl | BinaryContent) -> str | None:
+     return detail if isinstance(detail, str) else None
+ 
+ 
++# 兜底正文：整轮模型输出只有思考（如模型退化复读 <think>），既无正文也无工具调用时，
++# pydantic_ai 会判为非法输出并抛 ToolRetryError（默认 max_output_retries=1，重试一次
++# 仍失败即 UnexpectedModelBehavior，整个 run 报废——用户看到思考块复读到一半对话被掐断）。
++# 注入占位正文让这轮以正常文本收尾，思考内容仍完整保留在前端思考块里。
++_FALLBACK_EMPTY_OUTPUT_TEXT = "（模型这轮只输出了思考，没有给出可用回答。请重试，或换个问法再问一次。）"
++
++
++def _ensure_actionable_output(
++    parts_manager: ModelResponsePartsManager,
++    provider_name: str,
++) -> list[ModelResponseStreamEvent]:
++    has_text = False
++    for part in parts_manager.get_parts():
++        if isinstance(part, TextPart):
++            if part.content.strip():
++                has_text = True
++        elif isinstance(part, ToolCallPart | FilePart):
++            has_text = True
++        if has_text:
++            break
++    if has_text:
++        return []
++    return list(
++        parts_manager.handle_text_delta(
++            vendor_part_id=None,
++            content=_FALLBACK_EMPTY_OUTPUT_TEXT,
++            provider_name=provider_name,
++        )
++    )
++
++
+ def _parse_assistant_text_parts(content: str) -> list[ModelResponsePart]:
+     response_parts: list[ModelResponsePart] = []
+     cursor = 0
+@@ -731,6 +793,63 @@ def _parse_assistant_text_parts(content: str) -> list[ModelResponsePart]:
+ class _EmbeddedThinkingParser:
+     _pending: str = ""
+     _inside_thinking: bool = False
++    # 复读熔断：模型退化时会在 <think> 里逐字复读同一句（事故见 2026-09-24 drawio 会话），
++    # 不拦截会把几十万字符垃圾灌进思考块并烧掉 token。delta 粒度因供应商而异，
++    # 故同时按「连续相同」与「累计相同」两个口径计数，任一超限即丢弃后续思考增量。
++    _last_think_delta: str = ""
++    _think_repeat_streak: int = 0
++    _think_repeat_totals: dict[str, int] = field(default_factory=dict)
++    _think_circuit_broken: bool = False
++
++    def _emit_thinking(
++        self,
++        parts_manager: ModelResponsePartsManager,
++        provider_name: str,
++        content: str,
++    ) -> list[ModelResponseStreamEvent]:
++        if self._think_circuit_broken or not content:
++            return []
++        events: list[ModelResponseStreamEvent] = []
++        # delta 粒度因供应商而异：退化复读可能整段塞在一个 delta 里到达，
++        # 因此按句子切片统计（切片首尾相接还原原文，不改变思考内容本身）。
++        for match in _THINK_SEGMENT_RE.finditer(content):
++            seg = match.group(0)
++            if self._think_circuit_broken:
++                break
++            key = seg.strip()
++            if len(key) >= 4:
++                if key == self._last_think_delta:
++                    self._think_repeat_streak += 1
++                else:
++                    self._last_think_delta = key
++                    self._think_repeat_streak = 1
++                total = self._think_repeat_totals.get(key, 0) + 1
++                if len(self._think_repeat_totals) > 512:
++                    self._think_repeat_totals.clear()
++                self._think_repeat_totals[key] = total
++                periodic = _periodic_repeat_count(seg) if len(seg) >= _THINK_PERIODIC_MIN_LEN else 1
++                if (
++                    self._think_repeat_streak >= _THINK_REPEAT_STREAK_LIMIT
++                    or total >= _THINK_REPEAT_TOTAL_LIMIT
++                    or periodic >= _THINK_REPEAT_STREAK_LIMIT
++                ):
++                    self._think_circuit_broken = True
++                    logger.warning(
++                        "thinking repetition circuit breaker tripped (streak=%d, total=%d, periodic=%d, sample=%.40r)",
++                        self._think_repeat_streak,
++                        total,
++                        periodic,
++                        key,
++                    )
++                    break
++            events.extend(
++                parts_manager.handle_thinking_delta(
++                    vendor_part_id=None,
++                    content=seg,
++                    provider_name=provider_name,
++                )
++            )
++        return events
+ 
+     def parse(
+         self,
+@@ -748,10 +867,10 @@ class _EmbeddedThinkingParser:
+                 if end_index >= 0:
+                     if end_index > 0:
+                         events.extend(
+-                            parts_manager.handle_thinking_delta(
+-                                vendor_part_id=None,
+-                                content=buffer[:end_index],
+-                                provider_name=provider_name,
++                            self._emit_thinking(
++                                parts_manager,
++                                provider_name,
++                                buffer[:end_index],
+                             )
+                         )
+                     buffer = buffer[end_index + len(_THINK_CLOSE_TAG) :]
+@@ -761,10 +880,10 @@ class _EmbeddedThinkingParser:
+                 safe_content, self._pending = _split_incomplete_tag_suffix(buffer, _THINK_CLOSE_TAG)
+                 if safe_content:
+                     events.extend(
+-                        parts_manager.handle_thinking_delta(
+-                            vendor_part_id=None,
+-                            content=safe_content,
+-                            provider_name=provider_name,
++                        self._emit_thinking(
++                            parts_manager,
++                            provider_name,
++                            safe_content,
+                         )
+                     )
+                 break
+@@ -807,12 +926,10 @@ class _EmbeddedThinkingParser:
+         pending = self._pending
+         self._pending = ""
+         if self._inside_thinking:
+-            return list(
+-                parts_manager.handle_thinking_delta(
+-                    vendor_part_id=None,
+-                    content=pending,
+-                    provider_name=provider_name,
+-                )
++            return self._emit_thinking(
++                parts_manager,
++                provider_name,
++                pending,
+             )
+         return list(
+             parts_manager.handle_text_delta(

@@ -1,0 +1,69 @@
+diff --git a/api/core/memory/token_buffer_memory.py b/api/core/memory/token_buffer_memory.py
+index b83f3b842..6b0e2b0dc 100644
+--- a/api/core/memory/token_buffer_memory.py
++++ b/api/core/memory/token_buffer_memory.py
+@@ -1,5 +1,6 @@
+ from collections import defaultdict
+ from collections.abc import Sequence
++from typing import cast
+ 
+ from sqlalchemy import select
+ from sqlalchemy.orm import sessionmaker
+@@ -20,6 +21,8 @@ from graphon.model_runtime.entities import (
+     UserPromptMessage,
+ )
+ from graphon.model_runtime.entities.message_entities import PromptMessageContentUnionTypes
++from graphon.model_runtime.entities.model_entities import ModelFeature
++from graphon.model_runtime.model_providers.base.large_language_model import LargeLanguageModel
+ from models.model import AppMode, Conversation, Message, MessageFile
+ from models.workflow import Workflow
+ from repositories.api_workflow_run_repository import APIWorkflowRunRepository
+@@ -37,6 +40,23 @@ class TokenBufferMemory:
+         self.conversation = conversation
+         self.model_instance = model_instance
+         self._workflow_run_repo: APIWorkflowRunRepository | None = None
++        self._vision_supported: bool | None = None
++
++    def _model_supports_vision(self) -> bool:
++        """当前模型是否支持视觉输入（带实例级缓存，避免逐条历史消息重复查询）。"""
++        if self._vision_supported is None:
++            try:
++                llm_model = cast(LargeLanguageModel, self.model_instance.model_type_instance)
++                model_schema = llm_model.get_model_schema(
++                    self.model_instance.model_name, self.model_instance.credentials
++                )
++                self._vision_supported = bool(
++                    model_schema and model_schema.features and ModelFeature.VISION in model_schema.features
++                )
++            except Exception:
++                # 查询失败时保持原行为（附带文件），避免误伤视觉模型
++                self._vision_supported = True
++        return self._vision_supported
+ 
+     @property
+     def workflow_run_repo(self) -> APIWorkflowRunRepository:
+@@ -100,6 +120,24 @@ class TokenBufferMemory:
+         else:
+             file_objs = []
+ 
++        if not file_objs:
++            if is_user_message:
++                return UserPromptMessage(content=text_content)
++            else:
++                return AssistantPromptMessage(content=text_content)
++
++        # 历史消息里的图片内容不能无条件附给模型：
++        # - 非视觉模型（如 qwen 文本模型经通义插件）无法序列化 ImagePromptMessageContent，
++        #   会在 agent 的下一轮 LLM 调用中直接抛 dashscope UnsupportedDataType，
++        #   导致"生成过图片的会话从此每条消息都失败"（工具产物图片留在 assistant 历史里）。
++        # - 助手侧生成的文件（思维导图/动画等）只是给用户看的产物，签名 URL 会过期，
++        #   且 dashscope 的多模态接口也不接受 assistant 消息携带图片，一律降级为文字注记。
++        # 用户侧文件仅在模型支持视觉时附带，否则同样降级。
++        if not is_user_message or not self._model_supports_vision():
++            note = f"（本条消息附带的 {len(file_objs)} 个图片/文件未传给模型）"
++            text_content = f"{text_content}\n\n{note}" if text_content else note
++            file_objs = []
++
+         if not file_objs:
+             if is_user_message:
+                 return UserPromptMessage(content=text_content)
