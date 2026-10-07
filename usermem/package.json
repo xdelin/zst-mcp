@@ -1,0 +1,17 @@
+{
+  "name": "usermem-mcp",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "module",
+  "description": "用户级跨会话记忆层：偏好/技能目录/绑定文件/定时任务/任务历史（MCP + REST + 调度器）",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "axios": "^1.14.0",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.0",
+    "express": "^5.2.1"
+  }
+}
