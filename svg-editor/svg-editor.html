@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<title>SVG 文本坐标编辑器</title>
+<style>
+  html, body { margin: 0; height: 100%; font-family: -apple-system, "Segoe UI", sans-serif; background: #1a1d23; color: #e6e8eb; display: flex; flex-direction: column; }
+  #topbar { display: flex; align-items: center; gap: 10px; padding: 7px 14px; background: #232730; border-bottom: 1px solid #2e333d; flex: 0 0 auto; }
+  #topbar h1 { font-size: 13px; font-weight: 600; margin: 0; }
+  #topbar select, #topbar button { background: #2e333d; color: #e6e8eb; border: 1px solid #3a404b; border-radius: 8px; padding: 9px 16px; font-size: 14px; cursor: pointer; min-height: 40px; }
+  #topbar button:hover { background: #3a404b; }
+  #topbar button:disabled { opacity: .45; cursor: default; }
+  #topbar .spacer { flex: 1; }
+  #topbar2 { display: flex; align-items: center; gap: 10px; padding: 6px 14px; background: #1e222a; border-bottom: 1px solid #2e333d; flex: 0 0 auto; }
+  #topbar2 input[type=text] { flex: 1; background: #2a2e36; color: #e6e8eb; border: 1px solid #3a404b; border-radius: 8px; padding: 8px 10px; font-size: 14px; box-sizing: border-box; }
+  #topbar2 button, #topbar2 .upload-label { background: #2e333d; color: #e6e8eb; border: 1px solid #3a404b; border-radius: 8px; padding: 9px 16px; font-size: 14px; cursor: pointer; min-height: 40px; }
+  #topbar2 .upload-label:hover, #topbar2 button:hover { background: #3a404b; }
+  #status { font-size: 11px; color: #8b929d; }
+  #main { flex: 1; display: flex; min-height: 0; }
+  #stage-wrap { flex: 1; overflow: auto; background: #2a2e36; padding: 16px; position: relative; }
+  #stage-frame { background: #fff; box-shadow: 0 8px 24px rgba(0,0,0,.35); margin: 0 auto; overflow: hidden; position: relative; }
+  #sidebar { flex: 0 0 340px; background: #232730; border-left: 1px solid #2e333d; display: flex; flex-direction: column; min-height: 0; }
+  #sidebar h2 { font-size: 12px; margin: 0; padding: 10px 12px; border-bottom: 1px solid #2e333d; color: #b8bdc6; font-weight: 600; }
+  #list { flex: 1; overflow: auto; }
+  .item { padding: 6px 12px; border-bottom: 1px solid #2a2e36; font-size: 12px; cursor: pointer; display: flex; justify-content: space-between; gap: 8px; }
+  .item:hover { background: #2a2e36; }
+  .item.sel { background: #2f4a6b; }
+  .item.overlap { border-left: 3px solid #e0623a; }
+  .item .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; }
+  .item .c { color: #8b929d; font-size: 11px; white-space: nowrap; }
+  #props { flex: 0 0 auto; border-top: 1px solid #2e333d; padding: 10px 12px; font-size: 12px; }
+  #props label { display: block; margin: 6px 0 2px; color: #8b929d; }
+  #props input { width: 100%; background: #2a2e36; color: #e6e8eb; border: 1px solid #3a404b; border-radius: 6px; padding: 8px 10px; font-size: 16px; box-sizing: border-box; }
+  #props button { background: #3a404b; color: #e6e8eb; border: 1px solid #4a505d; border-radius: 8px; padding: 10px 16px; font-size: 15px; cursor: pointer; min-height: 44px; }
+  #props button:hover { background: #4a505d; }
+  #props label { font-size: 13px; }
+  #props .row { display: flex; gap: 8px; }
+  #props .row > div { flex: 1; }
+  .hint { color: #e0623a; font-size: 11px; margin-top: 4px; }
+</style>
+</head>
+<body>
+<div id="topbar">
+  <h1>SVG 文本坐标编辑器</h1>
+  <select id="animSelect"></select>
+  <button id="loadBtn">载入</button>
+  <select id="sceneSel"><option>场景 1</option></select>
+  <button id="checkBtn">检测重叠</button>
+  <button id="undoBtn" disabled>撤销</button>
+  <button id="exportBtn">导出</button>
+  <span class="spacer"></span>
+  <span id="status">就绪</span>
+</div>
+<div id="topbar2">
+  <input id="nameUrl" type="text" placeholder="动画文件名（anim_xxx.html）或 http(s):// 链接，回车载入">
+  <button id="nameLoadBtn">载入</button>
+  <label class="upload-label">上传本地 HTML<input id="uploadInput" type="file" accept=".html,.htm" style="display:none"></label>
+</div>
+<div id="main">
+  <div id="stage-wrap"><div id="stage-frame"></div></div>
+  <div id="sidebar">
+    <h2 id="listHead">文本列表（0）</h2>
+    <div id="list"></div>
+    <div id="props">
+      <div style="color:#8b929d">点选左侧或画布中的文字编辑坐标</div>
+    </div>
+  </div>
+</div>
+
+<script>
+let FILES = [];        // 动态文件列表：当前载入的在前，后端接口可选补充
+const uploads = {};   // 本地上传的文件内容缓存：文件名 -> html（支持下拉重选）
+const PADDING = 3;
+let stage = null;      // 当前展示的 svg scene 容器
+let svgRoot = null;    // <svg> 元素
+let texts = [];        // [{el, box, cx, t, sceneIdx}]
+let selIdx = -1;
+let overlapPairs = [];
+let sceneIdx = 0;
+let allScenes = [];
+let bigSvg = null;    // B格式：所有场景 g 所在的唯一大 svg
+let sceneSvg = null;  // 坐标基准 svg（bbox/拖拽/overlay 都用它转换）
+let rawHtml = '';          // 原始完整 HTML（含所有动态逻辑）
+let edits = {};          // key='sceneId:textIdx' -> {x,y,fs}
+let curSceneId = '';
+let curFileName = '';
+let stageRatio = 0;   // 当前内容的宽高比（viewBox），画布自适应用
+
+const sel = document.getElementById('animSelect');
+function rebuildFileOptions(){
+  // 下拉 = 当前载入的文件在最前 + 动态列表（去重）；没载入过显示占位
+  var names = [];
+  if (curFileName) names.push(curFileName);
+  FILES.forEach(function(o){ if (names.indexOf(o.n) < 0) names.push(o.n); });
+  sel.innerHTML = '';
+  if (!names.length) { sel.add(new Option('（未载入文件）', '')); return; }
+  names.forEach(function(n){ sel.add(new Option(n, n)); });
+  sel.value = curFileName || names[0];
+}
+rebuildFileOptions();
+// 从后端拉动画列表补充进下拉（老进程无此接口时忽略，不打扰）
+fetch('/api/anims').then(function(r){ return r.ok ? r.json() : Promise.reject(); })
+  .then(function(list){
+    if (Array.isArray(list) && list.length) {
+      FILES = list.map(function(n){ return {n: n, t: ''}; });
+      rebuildFileOptions();
+    }
+  }).catch(function(){});
+
+// 画布自适应：按内容比例在可用区域内最大化 stage-frame
+function fitStage() {
+  if (!stageRatio) return;
+  var wrap = document.getElementById('stage-wrap');
+  var fr = document.getElementById('stage-frame');
+  var availW = Math.max(wrap.clientWidth - 32, 200);
+  var availH = Math.max(wrap.clientHeight - 32, 150);
+  var w = availW, h = w / stageRatio;
+  if (h > availH) { h = availH; w = h * stageRatio; }
+  fr.style.width = Math.round(w) + 'px';
+  fr.style.height = Math.round(h) + 'px';
+}
+window.addEventListener('resize', fitStage);
+
+// 真实边界盒（含父级 transform）
+function bboxIn(el) {
+  // 用浏览器实际渲染位置 getBoundingClientRect，转回 svg viewBox 坐标，绝对准确
+  if (!sceneSvg) return null;
+  const r = el.getBoundingClientRect();
+  if (r.width === 0 || r.height === 0) return null;
+  const m = sceneSvg.getScreenCTM();
+  if (!m) return null;
+  // 屏幕坐标 -> svg 用户坐标：用 sceneSvg 的 CTM 逆变换
+  const pt = sceneSvg.createSVGPoint();
+  pt.x = r.left; pt.y = r.top;
+  const p1 = pt.matrixTransform(m.inverse());
+  pt.x = r.right; pt.y = r.bottom;
+  const p2 = pt.matrixTransform(m.inverse());
+  return { x: p1.x, y: p1.y, w: p2.x - p1.x, h: p2.y - p1.y };
+}
+function ov(a,b,p) { p=p||0; return !(a.x+a.w+p<=b.x||b.x+b.w+p<=a.x||a.y+a.h+p<=b.y||b.y+b.h+p<=a.y); }
+
+// ---------------- 撤销：编辑/拖拽/删除前存快照（edits 全量 + 当前场景 DOM） ----------------
+let undoStack = [];       // [{label, edits, sceneIdx, sceneInner}]
+let pendingDragSnap = null;  // pointerdown 时先备好，真正拖动那一刻才入栈
+const UNDO_MAX = 60;
+
+function updateUndoBtn() {
+  document.getElementById('undoBtn').disabled = !undoStack.length;
+}
+function captureSnapshot(label, key) {
+  if (overlayLayer) overlayLayer.remove();   // 选中框/高亮框不进快照
+  const snap = {
+    label: label,
+    key: key || '',
+    edits: JSON.parse(JSON.stringify(edits)),
+    sceneIdx: sceneIdx,
+    sceneInner: svgRoot ? svgRoot.innerHTML : ''
+  };
+  drawOverlay();
+  return snap;
+}
+function pushUndo(label, key) {
+  if (!svgRoot) return;
+  undoStack.push(captureSnapshot(label, key));
+  if (undoStack.length > UNDO_MAX) undoStack.shift();
+  updateUndoBtn();
+}
+// 连续键入合并为一次撤销：1.5s 内同一目标文本的同类操作只留最初那份快照
+let _lastPushAt = 0;
+function pushUndoTyping(label, key) {
+  const now = Date.now();
+  const top = undoStack[undoStack.length - 1];
+  if (now - _lastPushAt < 1500 && top && top.label === label && top.key === (key || '')) {
+    _lastPushAt = now;
+    return;
+  }
+  pushUndo(label, key);
+  _lastPushAt = now;
+}
+function doUndo() {
+  if (!undoStack.length) { document.getElementById('status').textContent = '没有可撤销的操作'; return; }
+  const snap = undoStack.pop();
+  pendingDragSnap = null;
+  edits = snap.edits;
+  if (snap.sceneIdx !== sceneIdx) selectScene(snap.sceneIdx);
+  if (overlayLayer) { overlayLayer.remove(); overlayLayer = null; }
+  svgRoot.innerHTML = snap.sceneInner;
+  selIdx = -1;
+  document.getElementById('props').innerHTML = '<div style="color:#8b929d">已撤销：' + snap.label + '。点选文字继续编辑</div>';
+  rebuildList(); detectOverlaps(); renderList(); drawOverlay();
+  document.getElementById('listHead').textContent = '场景 ' + (sceneIdx + 1) + ' 文本（' + texts.length + '）';
+  document.getElementById('status').textContent = '已撤销：' + snap.label + '（剩余 ' + undoStack.length + ' 步）';
+  updateUndoBtn();
+}
+document.getElementById('undoBtn').onclick = doUndo;
+document.addEventListener('keydown', function(e){
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'z') {
+    // 焦点在输入框时让浏览器自己撤文本，不抢
+    var tag = (e.target && e.target.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea') return;
+    e.preventDefault();
+    doUndo();
+  }
+});
+
+async function loadAnim(name) {
+  if (!name) return;
+  document.getElementById('status').textContent = '载入中…';
+  if (uploads[name] !== undefined) {   // 本地上传过的文件直接用缓存
+    rawHtml = uploads[name];
+    applyLoadedHtml(name);
+    return;
+  }
+  var url = /^https?:\/\//i.test(name) ? name : ('/static/generated/' + name);
+  try {
+    rawHtml = await (await fetch(url)).text();
+  } catch (e) {
+    document.getElementById('status').textContent = '载入失败：' + e.message;
+    return;
+  }
+  applyLoadedHtml(name);
+}
+
+// 本地上传入口：FileReader 读完整 HTML 后走同一管线
+document.getElementById('uploadInput').onchange = function(){
+  var f = this.files && this.files[0];
+  if (!f) return;
+  var rd = new FileReader();
+  rd.onload = function(){ rawHtml = rd.result; uploads[f.name] = rd.result; applyLoadedHtml(f.name); };
+  rd.readAsText(f);
+};
+
+function applyLoadedHtml(name) {
+  curFileName = name;
+  edits = {};          // 换文件必须清空编辑记录（sceneId 会撞名）
+  undoStack = [];      // 撤销栈同样只对当前文件有效
+  pendingDragSnap = null;
+  updateUndoBtn();
+  selIdx = -1;
+  rebuildFileOptions();  // 下拉同步显示当前文件名
+  const html = rawHtml;
+  const frame = document.getElementById('stage-frame');
+  frame.innerHTML = html;
+  // 剥掉载入 HTML 自带的 script（动画/音频/panel 控制脚本会干扰编辑）
+  frame.querySelectorAll('script').forEach(function(s){ s.remove(); });
+  // 格式识别：
+  // A 型：多个独立 <svg class="scene">，每场景一个 svg
+  // B 型：单个大 svg，顶层 <g id="sceneN" class="scene"> 分组当场景（CSS/JS 控制显隐）
+  var svgScenes = Array.from(frame.querySelectorAll('svg.scene'));
+  bigSvg = null;
+  if (svgScenes.length) {
+    allScenes = svgScenes;
+    frame.innerHTML = '';
+    allScenes.forEach(function(sv){ frame.appendChild(sv); });
+  } else {
+    var svgs = Array.from(frame.querySelectorAll('svg'));
+    if (!svgs.length) { document.getElementById('status').textContent = '未找到 svg 文本（可能是 DOM 型动画）'; document.title='NOSVG'; return; }
+    bigSvg = svgs[0];
+    // 找大 svg 顶层的场景 g
+    var gScenes = Array.from(bigSvg.children).filter(function(el){
+      return el.tagName === 'g' && ((el.id && /^scene/.test(el.id)) || (el.classList && el.classList.contains('scene')));
+    });
+    if (gScenes.length >= 2) {
+      allScenes = gScenes;   // B 型：g 分组即场景
+    } else {
+      allScenes = [bigSvg];  // 兜底：整个 svg 当一个场景
+      bigSvg = null;
+    }
+    frame.innerHTML = '';
+    frame.appendChild(bigSvg || allScenes[0]);
+  }
+  // 入场动画隐藏的元素在编辑视图强制可见：
+  // 原始文件常把标题包在 <g opacity="0"> 里、由 JS/CSS 渐显；
+  // 编辑器剥掉了 script/style，这些元素会永远隐藏。这里只改编辑视图 DOM，
+  // 导出回写的是 rawHtml 原始属性，动画渐显效果不受影响。
+  Array.from(frame.querySelectorAll('[opacity]')).forEach(function(el){
+    if (parseFloat(el.getAttribute('opacity')) === 0) el.setAttribute('opacity', '1');
+  });
+  Array.from(frame.querySelectorAll('[visibility=\'hidden\']')).forEach(function(el){
+    el.removeAttribute('visibility');
+  });
+  // 自适应尺寸：按内容 viewBox 比例缩放画布；svg 铺满画布（不再写死 900x540）
+  var baseSvg = bigSvg || allScenes[0];
+  if (baseSvg && baseSvg.tagName === 'svg') {
+    var vb = baseSvg.viewBox && baseSvg.viewBox.baseVal;
+    var cw = (vb && vb.width) || parseFloat(baseSvg.getAttribute('width')) || 1000;
+    var chh = (vb && vb.height) || parseFloat(baseSvg.getAttribute('height')) || 600;
+    stageRatio = cw / chh;
+  } else {
+    stageRatio = 900 / 540;
+  }
+  Array.from(frame.querySelectorAll('svg')).forEach(function(sv){
+    var v = sv.viewBox && sv.viewBox.baseVal;
+    if (!(v && v.width)) {
+      // 无 viewBox 的 svg：按原 width/height 补一个，保证能整体缩放
+      var w2 = parseFloat(sv.getAttribute('width')) || 1000;
+      var h2 = parseFloat(sv.getAttribute('height')) || 600;
+      sv.setAttribute('viewBox', '0 0 ' + w2 + ' ' + h2);
+    }
+    sv.removeAttribute('width'); sv.removeAttribute('height');
+    sv.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+    sv.style.width = '100%'; sv.style.height = '100%';
+    sv.style.display = 'block'; sv.style.position = 'relative';
+    sv.style.top = '0'; sv.style.left = '0'; sv.style.maxWidth = 'none';
+  });
+  fitStage();
+  // 场景单元默认全部隐藏（内联 display 压制原 CSS 的 opacity 叠加显隐）
+  allScenes.forEach(function(sc){ sc.style.display = 'none'; });
+  // 填充 scene 下拉
+  var ss = document.getElementById('sceneSel');
+  ss.innerHTML = '';
+  allScenes.forEach(function(_, i){ ss.add(new Option('场景 ' + (i+1), i)); });
+  sceneIdx = 0; ss.value = 0;
+  svgRoot = allScenes[0];
+  sceneSvg = bigSvg || svgRoot;
+  if (!svgRoot) { document.getElementById('status').textContent = '未找到 svg'; document.title='NOSVG'; return; }
+  svgRoot.style.display = 'block';
+  stage = svgRoot;
+  rebuildList();
+  document.getElementById('status').textContent = '已载入 ' + name + '，' + texts.length + ' 个文本';
+  document.title = 'LOADED items=' + texts.length + ' ov=' + overlapPairs.length;
+  document.getElementById('listHead').textContent = '文本列表（' + texts.length + '）';
+  detectOverlaps();
+  renderList();
+
+  var _q = new URLSearchParams(location.search);
+  if (_q.get('scene')) { selectScene(parseInt(_q.get('scene'))); }
+
+
+
+
+
+
+
+
+
+
+
+
+}
+
+function rebuildList() {
+  texts = [];
+  if (!svgRoot) return;
+  curSceneId = svgRoot.getAttribute('id') || ('scene' + sceneIdx);
+  const ts = svgRoot.querySelectorAll('text');
+  // 该 scene 内所有 text（含不可见），用于回写时定位序号
+  const allTs = svgRoot.querySelectorAll('text');
+  let visIdx = 0;
+  ts.forEach((el, i) => {
+    const cs = getComputedStyle(el);
+    if (cs.display==='none' || cs.visibility==='hidden' || parseFloat(cs.opacity)===0) return;
+    const box = bboxIn(el);
+    if (!box || box.w<=0 || box.h<=0) return;
+    const realIdx = Array.from(allTs).indexOf(el);
+    texts.push({ el, box, cx: box.x + box.w/2, t: (el.textContent||'').trim().slice(0,24), i, sceneId: curSceneId, textIdx: realIdx });
+  });
+}
+
+function detectOverlaps() {
+  overlapPairs = [];
+  for (let i=0;i<texts.length;i++) for (let j=i+1;j<texts.length;j++) {
+    if (ov(texts[i].box, texts[j].box, 0)) overlapPairs.push([i,j]);
+  }
+}
+function isOverlap(idx) { return overlapPairs.some(p => p[0]===idx || p[1]===idx); }
+
+function renderList() {
+  const list = document.getElementById('list');
+  list.innerHTML = '';
+  texts.forEach((tx, idx) => {
+    const div = document.createElement('div');
+    div.className = 'item' + (idx===selIdx?' sel':'') + (isOverlap(idx)?' overlap':'');
+    div.innerHTML = '<span class="t">' + (tx.t||'(空)') + '</span><span class="c">y=' + Math.round(tx.box.y) + '</span>';
+    div.onclick = () => selectText(idx);
+    list.appendChild(div);
+  });
+}
+
+function selectText(idx) {
+  selIdx = idx;
+  renderList();
+  drawOverlay();
+  if (idx < 0) {
+    document.getElementById('props').innerHTML = '<div style="color:#8b929d">点选左侧或画布中的文字编辑坐标</div>';
+    return;
+  }
+  const tx = texts[idx];
+  const el = tx.el;
+  const x = parseFloat(el.getAttribute('x')) || 0;
+  const y = parseFloat(el.getAttribute('y')) || 0;
+  const fs = el.getAttribute('font-size') || '';
+  const ovInfo = isOverlap(idx) ? '<div class="hint">⚠ 与其他文本重叠</div>' : '';
+  const content = (el.textContent || '').trim();
+  document.getElementById('props').innerHTML =
+    '<label>文本内容</label><input id="pContent" type="text" value="' + content.replace(/"/g, '&quot;') + '">' +
+    '<div class="row" style="margin-top:8px"><div><label>x</label><input id="pX" type="number" value="' + x + '" step="1"></div>' +
+    '<div><label>y</label><input id="pY" type="number" value="' + y + '" step="1"></div></div>' +
+    '<label>font-size</label><input id="pFs" type="number" value="' + fs + '" step="1">' +
+    ovInfo +
+    '<button id="delBtn" style="margin-top:10px;width:100%;background:#5a2a2a;border-color:#7a3a3a;color:#ffb3b3">删除该文本</button>'
+  // 实时应用：输入即生效，不重建列表（避免失焦）
+  function liveApply() {
+    pushUndoTyping('编辑属性', texts[selIdx].sceneId + ':' + texts[selIdx].textIdx);
+    const el = texts[selIdx].el;
+    const nx = document.getElementById('pX').value;
+    const ny = document.getElementById('pY').value;
+    const nfs = document.getElementById('pFs').value;
+    if (nx !== '') el.setAttribute('x', nx);
+    if (ny !== '') el.setAttribute('y', ny);
+    if (nfs !== '') el.setAttribute('font-size', nfs);
+    recordEdit(texts[selIdx], nx, ny, nfs);
+    // 只更新 box + overlay，不 renderList（避免输入框失焦）
+    texts[selIdx].box = bboxIn(el);
+    drawOverlay();
+    // 更新列表项的 y 显示
+    const item = document.querySelectorAll('#list .item')[selIdx];
+    if (item) item.querySelector('.c').textContent = 'y=' + Math.round(texts[selIdx].box.y);
+  }
+  ['pX','pY','pFs'].forEach(function(id){
+    document.getElementById(id).addEventListener('input', liveApply);
+  });
+  // 文本内容实时编辑
+  document.getElementById('pContent').addEventListener('input', function(){
+    pushUndoTyping('编辑文本内容', texts[selIdx].sceneId + ':' + texts[selIdx].textIdx);
+    const el = texts[selIdx].el;
+    el.textContent = document.getElementById('pContent').value;
+    recordEdit(texts[selIdx], '', '', '');
+    // 记录内容改动用一个特殊标记
+    edits[texts[selIdx].sceneId + ':' + texts[selIdx].textIdx].content = document.getElementById('pContent').value;
+    texts[selIdx].box = bboxIn(el);
+    drawOverlay();
+    // 更新列表显示
+    texts[selIdx].t = (el.textContent || '').trim().slice(0,24);
+    const item = document.querySelectorAll('#list .item')[selIdx];
+    if (item) item.querySelector('.t').textContent = texts[selIdx].t || '(空)';
+  });
+  // 删除文本
+  document.getElementById('delBtn').onclick = function(){
+    if (!confirm('删除该文本？')) return;
+    pushUndo('删除文本');
+    const tx = texts[selIdx];
+    // 记录删除标记
+    edits[tx.sceneId + ':' + tx.textIdx] = { deleted: true };
+    tx.el.remove();
+    rebuildList(); detectOverlaps(); renderList(); drawOverlay();
+    document.getElementById('props').innerHTML = '<div style="color:#8b929d">已删除。选择其他文本继续编辑</div>';
+    document.getElementById('status').textContent = '已删除文本';
+    selIdx = -1;
+  };
+}
+
+function applyProps() {
+  const el = texts[selIdx].el;
+  const tx = texts[selIdx];
+  const nx = document.getElementById('pX').value;
+  const ny = document.getElementById('pY').value;
+  const nfs = document.getElementById('pFs').value;
+  if (nx !== '') el.setAttribute('x', nx);
+  if (ny !== '') el.setAttribute('y', ny);
+  if (nfs !== '') el.setAttribute('font-size', nfs);
+  recordEdit(tx, nx, ny, nfs);
+  refreshAfterEdit();
+}
+function recordEdit(tx, nx, ny, fs) {
+  const key = tx.sceneId + ':' + tx.textIdx;
+  if (!edits[key]) edits[key] = {};
+  if (nx !== '') edits[key].x = nx;
+  if (ny !== '') edits[key].y = ny;
+  if (fs !== '') edits[key].fs = fs;
+}
+
+function changeAttr(attr, val) {
+  const el = texts[selIdx].el;
+  const tx = texts[selIdx];
+  el.setAttribute(attr, val);
+  if (attr==='x') recordEdit(tx, val, '', '');
+  else if (attr==='y') recordEdit(tx, '', val, '');
+  refreshAfterEdit();
+}
+
+function refreshAfterEdit() {
+  rebuildList();
+  detectOverlaps();
+  renderList();
+  selectText(selIdx); // 重新刷属性面板
+}
+
+// 在画布上叠加选中框 + 重叠高亮
+let overlayLayer = null;
+function drawOverlay() {
+  if (overlayLayer) overlayLayer.remove();
+  if (!svgRoot) return;
+  const ns = 'http://www.w3.org/2000/svg';
+  overlayLayer = document.createElementNS(ns, 'g');
+  overlayLayer.setAttribute('id', '__edit_overlay');
+  overlayLayer.style.pointerEvents = 'none';
+  texts.forEach((tx, idx) => {
+    const b = tx.box;
+    const r = document.createElementNS(ns, 'rect');
+    r.setAttribute('x', b.x); r.setAttribute('y', b.y);
+    r.setAttribute('width', b.w); r.setAttribute('height', b.h);
+    r.setAttribute('fill', 'none');
+    if (idx === selIdx) { r.setAttribute('stroke', '#1565d8'); r.setAttribute('stroke-width', '2'); }
+    else if (isOverlap(idx)) { r.setAttribute('stroke', '#e0623a'); r.setAttribute('stroke-width', '1.5'); r.setAttribute('stroke-dasharray','4 3'); }
+    else return; // 不画普通框，避免太挤
+    overlayLayer.appendChild(r);
+  });
+  sceneSvg.appendChild(overlayLayer);
+}
+
+// 拖拽编辑：mousedown 选中文字并开始拖拽，mousemove 改 x/y，mouseup 记录 edit
+function bindCanvasClick() {
+  const frame = document.getElementById('stage-frame');
+  let drag = null; // {idx, sx, sy, ox, oy, moved}
+
+  // 屏幕坐标 -> svg 用户坐标
+  function toSvg(clientX, clientY) {
+    const pt = sceneSvg.createSVGPoint();
+    pt.x = clientX; pt.y = clientY;
+    const m = sceneSvg.getScreenCTM();
+    if (!m) return { x: clientX, y: clientY };
+    const p = pt.matrixTransform(m.inverse());
+    return { x: p.x, y: p.y };
+  }
+
+  frame.addEventListener('pointerdown', (e) => {
+    const t = e.target.closest('text');
+    if (!t || !svgRoot) return;
+    const idx = texts.findIndex(tx => tx.el === t);
+    if (idx < 0) return;
+    selectText(idx);
+    const el = texts[idx].el;
+    const ox = parseFloat(el.getAttribute('x')) || 0;
+    const oy = parseFloat(el.getAttribute('y')) || 0;
+    const sp = toSvg(e.clientX, e.clientY);
+    drag = { idx, sx: sp.x, sy: sp.y, ox, oy, moved: false };
+    pendingDragSnap = captureSnapshot('拖动文字');  // 真正动起来才入栈
+    el.style.cursor = 'grabbing';
+    el.style.userSelect = 'none';
+    try { el.setPointerCapture(e.pointerId); } catch(e){}
+    e.preventDefault();
+  });
+
+  frame.addEventListener('pointermove', (e) => {
+    if (!drag) return;
+    const sp = toSvg(e.clientX, e.clientY);
+    const dx = sp.x - drag.sx;
+    const dy = sp.y - drag.sy;
+    if ((Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) && !drag.moved) {
+      drag.moved = true;
+      if (pendingDragSnap) { undoStack.push(pendingDragSnap); pendingDragSnap = null; updateUndoBtn(); }
+    }
+    const el = texts[drag.idx].el;
+    const nx = Math.round((drag.ox + dx) * 10) / 10;
+    const ny = Math.round((drag.oy + dy) * 10) / 10;
+    el.setAttribute('x', nx);
+    el.setAttribute('y', ny);
+    // 实时刷新属性面板显示
+    const pX = document.getElementById('pX'); if (pX) pX.value = nx;
+    const pY = document.getElementById('pY'); if (pY) pY.value = ny;
+    // 实时更新边界盒，重画选中框
+    texts[drag.idx].box = bboxIn(el);
+    drawOverlay();
+  });
+
+  function endDrag(e) {
+    if (!drag) return;
+    if (!drag.moved) pendingDragSnap = null;   // 只是点选没拖，快照作废
+    const el = texts[drag.idx].el;
+    el.style.cursor = '';
+    if (drag.moved) {
+      recordEdit(texts[drag.idx], el.getAttribute('x'), el.getAttribute('y'), '');
+      refreshAfterEdit();
+      document.getElementById('status').textContent = '已移动文字至 (' + el.getAttribute('x') + ', ' + el.getAttribute('y') + ')';
+    }
+    try { el.releasePointerCapture(e.pointerId); } catch(e){}
+    drag = null;
+  }
+  frame.addEventListener('pointerup', endDrag);
+  frame.addEventListener('pointercancel', endDrag);
+}
+
+function selectScene(i){
+  sceneIdx = i;
+  allScenes.forEach(function(sv){ sv.style.display='none'; });
+  svgRoot = allScenes[i];
+  sceneSvg = bigSvg || svgRoot;  // B 型：坐标基准是大 svg；A 型：场景 svg 自己
+  svgRoot.style.display='block';
+  stage = svgRoot;
+  rebuildList(); detectOverlaps(); renderList(); drawOverlay();
+  document.getElementById('listHead').textContent = '场景 ' + (i+1) + ' 文本（' + texts.length + '）';
+  document.title = 'SCENE ' + (i+1) + ' items=' + texts.length + ' ov=' + overlapPairs.length;
+}
+document.getElementById('sceneSel').onchange = (e) => selectScene(parseInt(e.target.value));
+document.getElementById('loadBtn').onclick = () => loadAnim(sel.value);
+sel.onchange = () => { if (sel.value) loadAnim(sel.value); };  // 切下拉即自动加载
+document.getElementById('nameLoadBtn').onclick = () => {
+  var v = document.getElementById('nameUrl').value.trim();
+  if (v) loadAnim(v);
+};
+document.getElementById('nameUrl').addEventListener('keydown', function(e){
+  if (e.key === 'Enter') document.getElementById('nameLoadBtn').click();
+});
+document.getElementById('checkBtn').onclick = () => { detectOverlaps(); renderList(); drawOverlay();
+  document.getElementById('status').textContent = '重叠文本对：' + overlapPairs.length; };
+document.getElementById('exportBtn').onclick = () => {
+  if (!rawHtml) { document.getElementById('status').textContent = '未载入'; return; }
+  // DOMParser 按节点回写：A 型（svg.scene）和 B 型（嵌套 g.scene）都按 id 定位，
+  // 不用正则切嵌套结构，避免 g 套 g 时错位
+  const doc = new DOMParser().parseFromString(rawHtml, 'text/html');
+  let count = 0;
+  Object.keys(edits).forEach(function(key){
+    const parts = key.split(':');
+    const sceneId = parts[0]; const textIdx = parseInt(parts[1]);
+    const ed = edits[key];
+    const sceneEl = doc.getElementById(sceneId);
+    if (!sceneEl) return;
+    const textEls = sceneEl.querySelectorAll('text');
+    const el = textEls[textIdx];
+    if (!el) return;
+    if (ed.deleted) { el.remove(); count++; return; }
+    if (ed.x !== undefined) el.setAttribute('x', ed.x);
+    if (ed.y !== undefined) el.setAttribute('y', ed.y);
+    if (ed.fs !== undefined) el.setAttribute('font-size', ed.fs);
+    if (ed.content !== undefined) el.textContent = ed.content;
+    count++;
+  });
+  // 关键：导出统一 meet（完整显示画布）。原动画常用 slice（铺满裁切），
+  // 编辑器画布是 meet——两种映射下同一 viewBox 坐标落在屏幕的位置不同，
+  // 播放时文字会相对编辑器里调整的位置偏移（偏左/偏右）。归一成 meet 后
+  // 播放渲染与编辑器所见完全一致
+  doc.querySelectorAll('svg').forEach(function(sv){
+    sv.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+  });
+  const out = '<!DOCTYPE html>\n' + doc.documentElement.outerHTML;
+  const blob = new Blob([out], {type: 'text/html'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'edited_' + (curFileName || 'animation.html').replace(/[\\/:*?"<>|]/g, '_');
+  a.click();
+  document.getElementById('status').textContent = '已导出 edited_' + curFileName + '，改了 ' + count + ' 处文字（保留全部动态逻辑）';
+};
+
+bindCanvasClick();
+var _f = new URLSearchParams(location.search).get('file');
+if (_f) {
+  loadAnim(_f);
+} else {
+  // 无指定文件：尝试载入最新的动画（后端接口可用时）；否则提示上传/输入
+  fetch('/api/anims').then(function(r){ return r.ok ? r.json() : Promise.reject(); })
+    .then(function(list){
+      if (Array.isArray(list) && list.length) loadAnim(list[0]);
+      else document.getElementById('status').textContent = '输入文件名 / URL 或上传本地 HTML 开始';
+    })
+    .catch(function(){
+      document.getElementById('status').textContent = '输入文件名 / URL 或上传本地 HTML 开始';
+    });
+}
+</script>
+</body>
+</html>

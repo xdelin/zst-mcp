@@ -28,7 +28,7 @@ dify-agent server（pydantic-ai 分层、   →     dify-mods/overrides：并发
 | `dify-mods/` | 对官方运行时的二次开发：9 个补丁（+545 行，patch 形式）+ 2 个资源治理覆盖文件 | ~700 行增量 | — |
 | `usermem/` | 跨会话用户记忆服务（MCP + REST 双协议） | ~1200 行 Node.js | 8083 |
 | `ppt-judge/` | PPT 评审 MCP（LibreOffice 转换 + LLM 评审 + 标注图） | ~1000 行 Python | 8003 |
-| `fogsight/` | 互动教学动画生成 MCP 封装层（引擎为开源改造，见归属声明） | 封装层 ~700 行 | 8001 |
+| `fogsight/` | 互动教学动画生成 MCP 封装层（引擎为开源改造，见归属声明）+ 自研 SVG 文本坐标编辑器（文本重叠检测/修复） | 封装层 ~700 行 + 编辑器 ~840 行 | 8001 |
 | `agents/` | 两个自设计智能体的完整配置与 31 版迭代快照 | 38 个文件 | — |
 | `skills-catalog/` | 教育场景技能库策展管线：2063 → 248，16 一级分类，7 轮去重，可回滚 | 元数据 + 管线脚本 | — |
 
@@ -55,7 +55,7 @@ dify-agent server（底座）── 个人补丁：复读熔断 / run_failed 兜
 ## 归属与出处声明
 
 - Dify 主 api 与 `dify-agent/` 为 Dify 官方 Apache-2.0 代码，**不是本人编写**；本人增量为 `dify-mods/` 中的 patch 与 override（均明确标注 upstream 基线）。
-- `fogsight/app.py`、`app_3d.py` 等引擎文件来自开源项目 **Fogsight.ai**（LICENSE：CC BY-NC-ND 4.0，随附于 `fogsight/LICENSE`）；本人贡献为 MCP 封装层与平台对接脚本。仓库私有、不分发，保留原 LICENSE 与出处。
+- `fogsight/app.py`、`app_3d.py` 等引擎文件来自开源项目 **Fogsight.ai**（LICENSE：CC BY-NC-ND 4.0，随附于 `fogsight/LICENSE`）；本人贡献为 MCP 封装层、平台对接脚本及自研 SVG 文本编辑器（`static/svg-editor.html` + `text-anti-overlap.js`）。仓库私有、不分发，保留原 LICENSE 与出处。
 - 智能体配置快照导出自平台数据库快照表，为本人迭代过程的真实记录。
 
 ## 安全与隐私
