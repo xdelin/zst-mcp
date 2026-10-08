@@ -1,0 +1,33 @@
+# dify-mods 回归集 2026-10-08 01:48:01
+### cases/test_agent_backend.py @ docker-agent_backend-1
+thinking repetition circuit breaker tripped (streak=8, total=8, periodic=1, sample='这是一句会被复读的思考内容，用于回归验证。')
+thinking repetition circuit breaker tripped (streak=3, total=24, periodic=1, sample='这是一句会被复读的思考内容，用于回归验证。')
+thinking repetition circuit breaker tripped (streak=8, total=8, periodic=1, sample='这是一句会被复读的思考内容，用于回归验证。')
+
+=== agent_backend regress ===
+PASS  T1 streak=8 熔断且熔断后静默
+PASS  T2 total=24 熔断（streak 被打断场景）
+PASS  T3 正常多样思考不误伤
+PASS  T4 单 delta 周期性复读熔断
+PASS  T5 emit_run_failed 终态幂等
+total=5 failed=0
+### cases/test_api_patches.py @ docker-api-1
+
+=== api regress ===
+PASS  T6 非视觉模型正确识别
+PASS  T7 视觉能力判定实例级缓存
+PASS  T8 schema 查询异常回退不误伤
+PASS  T9 usermem 身份注入在位
+total=4 failed=0
+### cases/test_overrides_inplace.sh @ host
+PASS  磁盘配额常量 2048MB
+PASS  配额 create/resume 双时机
+PASS  shell job 上限 32
+PASS  bootstrap 超时放宽 300s
+PASS  并发闸门每用户 2 run
+PASS  闸门 429 状态码
+PASS  复读熔断 streak 阈值 8
+PASS  复读熔断 total 阈值 24
+PASS  工具产物 30MB 通道
+total=9 failed=0
+REGRESS: ALL GREEN
