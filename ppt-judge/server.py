@@ -95,6 +95,62 @@ DIFY_BASE_URL = os.getenv("DIFY_BASE_URL", "http://<internal-host>")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 REPORT_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "wpss-backend", "main_api", "reports"))
 
+# --- RATE LIMIT PATCH ---
+# 全局 + 租户两级限流，额度按 PPT 页数加权（后端全页并发分析，负载随页数线性增长）
+from rate_limit import WeightedRateLimiter, RateLimitRejected, env_int
+
+# 阶段一（请求闸门，权重恒为 1）：限制同时处于「下载 + 解析/转换 PPT」阶段的请求数，
+# 保护 COM / LibreOffice 这类重资源转换不被并发打爆
+REQUEST_GATE = WeightedRateLimiter(
+    global_budget=env_int("PPT_RATE_GLOBAL_REQUESTS", 8),
+    tenant_budget=env_int("PPT_RATE_TENANT_REQUESTS", 3),
+    max_waiting_per_tenant=env_int("PPT_RATE_MAX_WAITING", 4),
+    wait_timeout=env_int("PPT_RATE_WAIT_TIMEOUT", 120),
+)
+# 阶段二（页数加权额度）：调用后端 /ai/chat 前获取，额度 = PPT 页数
+PAGE_LIMITER = WeightedRateLimiter(
+    global_budget=env_int("PPT_RATE_GLOBAL_PAGES", 50),
+    tenant_budget=env_int("PPT_RATE_TENANT_PAGES", 20),
+    max_waiting_per_tenant=env_int("PPT_RATE_MAX_WAITING", 4),
+    wait_timeout=env_int("PPT_RATE_WAIT_TIMEOUT", 120),
+)
+
+
+def get_tenant_key() -> str:
+    """租户标识：MCP session id > 客户端 IP > default（REST 直调无 MCP 上下文，共享 default 桶）"""
+    try:
+        ctx = mcp.get_context()
+        sid = getattr(ctx, "session_id", None)
+        if sid:
+            return f"sess:{sid}"
+        req = getattr(getattr(ctx, "request_context", None), "request", None)
+        if req is not None:
+            qp = getattr(req, "query_params", None)
+            qs = qp.get("session_id") if qp else None
+            if qs:
+                return f"sess:{qs}"
+            host = getattr(getattr(req, "client", None), "host", "") or ""
+            if host:
+                return f"ip:{host}"
+    except Exception:
+        pass
+    return "default"
+
+
+def rate_limited(func):
+    """请求闸门装饰器：置于 cache_mcp_request 之内——相同请求先单飞合并，再参与限流。"""
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        tenant = get_tenant_key()
+        try:
+            async with REQUEST_GATE.slot(tenant):
+                return await func(*args, **kwargs)
+        except RateLimitRejected as e:
+            logger.warning(f"Request gate rejected tenant={tenant}: {e.message}")
+            return f"Error: {e.message}"
+    return wrapper
+# --- END RATE LIMIT PATCH ---
+
 def save_report(content: str) -> str:
     """保存报告为 Markdown 和 HTML，返回下载链接"""
     import markdown
@@ -531,6 +587,7 @@ async def _build_tool_result(text_with_images: str, report_url: str):
 
 @mcp.tool()
 @cache_mcp_request
+@rate_limited
 async def evaluate_ppt_with_evidence(
     ppt_file_path: str,
     evidence_file_path: Optional[str] = None,
@@ -611,23 +668,28 @@ async def evaluate_ppt_with_evidence(
         "ignore_ppt_context": False,
     }
 
-    # 4) 调用主服务流式接口（MCP工具层聚合结果）
+    # 4) 调用主服务流式接口（MCP工具层聚合结果）——页数加权限流：额度 = PPT 页数
     try:
-        full_response = await _call_ai_chat_stream(payload)
-        base_url = API_BASE.rstrip("/")
-        full_response_fixed = full_response.replace("](/api/static/", f"]({base_url}/api/static/")
-        full_response_fixed = full_response_fixed.replace(
-            'src="/api/static/', f'src="{base_url}/api/static/'
-        )
+        async with PAGE_LIMITER.slot(get_tenant_key(), weight=max(1, len(screenshots))):
+            full_response = await _call_ai_chat_stream(payload)
+            base_url = API_BASE.rstrip("/")
+            full_response_fixed = full_response.replace("](/api/static/", f"]({base_url}/api/static/")
+            full_response_fixed = full_response_fixed.replace(
+                'src="/api/static/', f'src="{base_url}/api/static/'
+            )
 
-        report_url = save_report(full_response_fixed)
-        return await _build_tool_result(full_response_fixed, report_url)
+            report_url = save_report(full_response_fixed)
+            return await _build_tool_result(full_response_fixed, report_url)
+    except RateLimitRejected as e:
+        logger.warning(f"Page limiter rejected: {e.message}")
+        return f"Error: {e.message}"
     except Exception as e:
         logger.error(f"Error in evaluate_ppt_with_evidence: {e}", exc_info=True)
         return f"Error: {str(e)}"
 
 @mcp.tool()
 @cache_mcp_request
+@rate_limited
 async def evaluate_file(file_path: str):
     """
     评价 PPT/幻灯片/课件的质量（结构、内容、逻辑、视觉设计），并给出改进建议。仅处理 PPT 类文件：.pptx 演示文稿、幻灯片 .pdf、PPT 页面截图 .png/.jpg。
@@ -697,48 +759,53 @@ async def evaluate_file(file_path: str):
         logger.error(f"Error processing file: {e}", exc_info=True)
         return f"Error processing file: {str(e)}"
 
-    # === 2. 调用后端 API ===
+    # === 2. 调用后端 API ===（页数加权限流：额度 = PPT 页数；截图单张按 1 页计）
+    page_weight = len(screenshots) if file_ext in (".pptx", ".pdf") else 1
     try:
-        api_url = f"{INTERNAL_API_BASE}/ai/chat"
-        logger.info(f"Calling backend API: {api_url}")
-        
-        # trust_env=False 禁用系统代理，防止 localhost 请求走代理导致 502 错误
-        async with httpx.AsyncClient(timeout=httpx.Timeout(3000.0, connect=60.0), trust_env=False) as client:
-            async with client.stream("POST", api_url, json=payload) as response:
-                if response.status_code != 200:
-                    # 尝试读取错误详情
-                    try:
-                        error_detail = await response.aread()
-                        error_msg = error_detail.decode('utf-8')
-                    except:
-                        error_msg = "No detail"
-                    logger.error(f"Backend API Error: {response.status_code} - {error_msg}")
-                    return f"Error: Backend returned status {response.status_code}. Detail: {error_msg}"
-                
-                full_response = ""
-                async for chunk in response.aiter_text():
-                    if not full_response:
-                        logger.info("First chunk received from backend")
-                    if len(full_response) % 10000 < len(chunk):
-                        logger.info(f"Received {len(full_response)} bytes so far...")
-                    full_response += chunk
-            
-            logger.info("Successfully received response from backend")
-            
-            # 🔥 替换相对路径为绝对路径，确保图片在 Dify/Chat 中正确显示
-            base_url = API_BASE.rstrip('/')
-            full_response_fixed = full_response.replace('](/api/static/', f']({base_url}/api/static/')
-            full_response_fixed = full_response_fixed.replace('src="/api/static/', f'src="{base_url}/api/static/')
-            
-            # 保存报告并生成链接
-            try:
-                report_url = save_report(full_response) # save_report handles its own replacement logic too
-                logger.info(f"Report saved to: {report_url}")
-                return await _build_tool_result(full_response_fixed, report_url)
-            except Exception as e:
-                logger.error(f"Failed to save report: {e}")
-                return f"{full_response_fixed}\n\n(生成报告文件失败: {str(e)})"
+        async with PAGE_LIMITER.slot(get_tenant_key(), weight=max(1, page_weight)):
+            api_url = f"{INTERNAL_API_BASE}/ai/chat"
+            logger.info(f"Calling backend API: {api_url}")
 
+            # trust_env=False 禁用系统代理，防止 localhost 请求走代理导致 502 错误
+            async with httpx.AsyncClient(timeout=httpx.Timeout(3000.0, connect=60.0), trust_env=False) as client:
+                async with client.stream("POST", api_url, json=payload) as response:
+                    if response.status_code != 200:
+                        # 尝试读取错误详情
+                        try:
+                            error_detail = await response.aread()
+                            error_msg = error_detail.decode('utf-8')
+                        except:
+                            error_msg = "No detail"
+                        logger.error(f"Backend API Error: {response.status_code} - {error_msg}")
+                        return f"Error: Backend returned status {response.status_code}. Detail: {error_msg}"
+
+                    full_response = ""
+                    async for chunk in response.aiter_text():
+                        if not full_response:
+                            logger.info("First chunk received from backend")
+                        if len(full_response) % 10000 < len(chunk):
+                            logger.info(f"Received {len(full_response)} bytes so far...")
+                        full_response += chunk
+
+                logger.info("Successfully received response from backend")
+
+                # 🔥 替换相对路径为绝对路径，确保图片在 Dify/Chat 中正确显示
+                base_url = API_BASE.rstrip('/')
+                full_response_fixed = full_response.replace('](/api/static/', f']({base_url}/api/static/')
+                full_response_fixed = full_response_fixed.replace('src="/api/static/', f'src="{base_url}/api/static/')
+
+                # 保存报告并生成链接
+                try:
+                    report_url = save_report(full_response) # save_report handles its own replacement logic too
+                    logger.info(f"Report saved to: {report_url}")
+                    return await _build_tool_result(full_response_fixed, report_url)
+                except Exception as e:
+                    logger.error(f"Failed to save report: {e}")
+                    return f"{full_response_fixed}\n\n(生成报告文件失败: {str(e)})"
+
+    except RateLimitRejected as e:
+        logger.warning(f"Page limiter rejected: {e.message}")
+        return f"Error: {e.message}"
     except Exception as e:
         logger.error(f"Error communicating with backend API: {e}", exc_info=True)
         return f"Error communicating with backend API: {str(e)}"
