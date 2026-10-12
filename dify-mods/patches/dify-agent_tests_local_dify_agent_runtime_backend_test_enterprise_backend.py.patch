@@ -1,0 +1,111 @@
+diff --git a/dify-agent/tests/local/dify_agent/runtime_backend/test_enterprise_backend.py b/dify-agent/tests/local/dify_agent/runtime_backend/test_enterprise_backend.py
+index 415884880..34070018f 100644
+--- a/dify-agent/tests/local/dify_agent/runtime_backend/test_enterprise_backend.py
++++ b/dify-agent/tests/local/dify_agent/runtime_backend/test_enterprise_backend.py
+@@ -75,8 +75,10 @@ async def test_enterprise_acquire_exposes_canonical_layout_through_gateway_proxy
+ 
+     def handler(request: httpx.Request) -> httpx.Response:
+         requests.append(request)
+-        assert request.headers["X-Sandbox-Id"] == "sandbox-1"
+         assert request.headers["X-Inner-Api-Key"] == "secret"
++        if request.url.path in ("/v1/sandboxes/sandbox-1/resume", "/v1/sandboxes/sandbox-1/pause"):
++            return httpx.Response(204)
++        assert request.headers["X-Sandbox-Id"] == "sandbox-1"
+         if request.method == "POST":
+             payload = cast(dict[str, object], json.loads(request.content))
+             script = payload["script"]
+@@ -98,12 +100,14 @@ async def test_enterprise_acquire_exposes_canonical_layout_through_gateway_proxy
+     assert lease.layout.home_dir == "/home/dify"
+     assert lease.layout.workspace_dir == "/workspace"
+     assert [request.url.path for request in requests] == [
++        "/v1/sandboxes/sandbox-1/resume",
+         "/proxy/v1/jobs/run",
+         "/proxy/v1/jobs/job-1",
+     ]
+-    assert clients[0].timeout.read == 90
++    assert clients[1].timeout.read == 90
+     await backend.release(lease)
+-    assert clients[0].is_closed
++    assert [request.url.path for request in requests][-1] == "/v1/sandboxes/sandbox-1/pause"
++    assert all(client.is_closed for client in clients)
+ 
+ 
+ @pytest.mark.anyio
+@@ -120,7 +124,9 @@ async def test_enterprise_acquire_maps_proxy_failures_and_closes_transport(
+     code: str,
+     expected_error: type[Exception],
+ ) -> None:
+-    def handler(_request: httpx.Request) -> httpx.Response:
++    def handler(request: httpx.Request) -> httpx.Response:
++        if request.url.path == "/v1/sandboxes/sandbox-1/resume":
++            return httpx.Response(204)
+         return httpx.Response(status_code, json={"error": {"code": code, "message": "unavailable"}})
+ 
+     clients = _mock_http(monkeypatch, handler)
+@@ -132,7 +138,65 @@ async def test_enterprise_acquire_maps_proxy_failures_and_closes_transport(
+     with pytest.raises(expected_error):
+         _ = await backend.acquire("sandbox-1")
+ 
+-    assert clients[0].is_closed
++    assert all(client.is_closed for client in clients)
++
++
++@pytest.mark.anyio
++@pytest.mark.parametrize(
++    ("status_code", "expected_error"),
++    [
++        (404, BindingLostError),
++        (502, BindingAcquireError),
++    ],
++)
++async def test_enterprise_acquire_resume_failure_mapping(
++    monkeypatch: pytest.MonkeyPatch,
++    status_code: int,
++    expected_error: type[Exception],
++) -> None:
++    def handler(_request: httpx.Request) -> httpx.Response:
++        return httpx.Response(status_code, json={"code": status_code, "reason": "gateway_down", "message": "down"})
++
++    clients = _mock_http(monkeypatch, handler)
++    backend = EnterpriseExecutionBindingBackend(
++        gateway_endpoint="http://gateway.example",
++        auth_token="secret",
++    )
++
++    with pytest.raises(expected_error):
++        _ = await backend.acquire("sandbox-1")
++
++    assert all(client.is_closed for client in clients)
++
++
++@pytest.mark.anyio
++async def test_enterprise_release_pauses_the_sandbox_best_effort(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    requests: list[httpx.Request] = []
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        requests.append(request)
++        if request.url.path == "/v1/sandboxes/sandbox-1/resume":
++            return httpx.Response(204)
++        if request.url.path == "/v1/sandboxes/sandbox-1/pause":
++            return httpx.Response(502, text="gateway down")
++        return _job_response()
++
++    clients = _mock_http(monkeypatch, handler)
++    backend = EnterpriseExecutionBindingBackend(
++        gateway_endpoint="http://gateway.example",
++        auth_token="secret",
++    )
++
++    lease = await backend.acquire("sandbox-1")
++    await backend.release(lease)
++
++    pause_requests = [request for request in requests if request.url.path == "/v1/sandboxes/sandbox-1/pause"]
++    assert len(pause_requests) == 1
++    assert pause_requests[0].method == "POST"
++    assert pause_requests[0].headers["X-Inner-Api-Key"] == "secret"
++    assert all(client.is_closed for client in clients)
+ 
+ 
+ @pytest.mark.anyio

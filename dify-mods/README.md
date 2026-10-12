@@ -4,8 +4,9 @@
 
 - `patches/` — 对 Dify 主 api 与 dify-agent 运行时的修改（`git diff` 导出，未回提交 upstream，通过 docker 挂载/本地运行生效）
 - `overrides/` — 覆盖 dify-agent 镜像内文件的完整替换文件（挂载到容器内对应路径）
+- `gateway/` — 自托管 E2B 式沙箱 Gateway（独立服务，非对官方文件的修改）
 
-## patches/ 一览（合计 +545 行）
+## patches/ 一览（合计 +656 行）
 
 | 补丁 | 目标文件（upstream 1.17.0） | 规模 | 解决什么 |
 |---|---|---|---|
@@ -17,6 +18,8 @@
 | `runtime_support` | `api/core/workflow/nodes/agent/` | +86 | agent 节点注入用户上传文件的**长效下载 URL**（HMAC 签名），替代会过期的短时签名 |
 | `mcp_tools_manage_service` | `api/services/tools/` | +22 | MCP provider 列表 `id` 字段为 server_identifier 而非 UUID 的兼容校验修复 |
 | `test_layers` | `dify-agent/tests/.../test_layers.py` | +24 | 与 tools_layer 改动同步的测试 |
+| `enterprise` | `dify-agent/.../runtime_backend/enterprise.py` | +42 | **沙箱生命周期客户端侧**：release 即 `POST pause`（失败仅告警，闲置 reaper 兜底）；acquire 重连先自动 resume（404 → BindingLost）——对齐官方 E2B connect 语义 |
+| `test_enterprise` | `dify-agent/tests/.../test_enterprise_backend.py` | +69 | 与 enterprise 改动同步的单测：resume 失败映射、release 恰好一次带鉴权头的 pause |
 | `docker-compose` | `docker/docker-compose.yaml` | +2 | 沙箱内 pip 安装走内网镜像源（PIP_INDEX_URL / PIP_TRUSTED_HOST） |
 
 ## overrides/ 一览（资源治理）
@@ -25,10 +28,14 @@
 
 | 覆盖文件 | 对应 upstream | 核心改动 |
 |---|---|---|
-| `dify_agent_shell_layer.py` | `src/dify_agent/layers/shell/layer.py`（114→更名对照，+59 行差异） | ① 每个 Binding（home+workspace）**磁盘配额 2048MB**：`du -sm` 汇总校验，超限本轮 run 直接失败并给明确原因，context create / resume 双时机检查（防 dd/海量下载灌满宿主机）② **单轮 run shell job 数上限 32**（防模型失控海量起任务）③ workspace bootstrap（npm install 等）超时单独放宽 300s，用户工具默认 30s 不变 |
+| `dify_agent_shell_layer.py` | `src/dify_agent/layers/shell/layer.py`（114→重命名扩展，+90 行差异） | ① 每个 Binding（home+workspace）**磁盘配额 2048MB**：`du -sm` 汇总校验，超限本轮 run 直接失败并给明确原因，context create / resume 双时机检查（防 dd/海量下载灌满宿主机）② **单轮 run 未完成 shell job 数上限 32**（防模型失控海量起任务）——**完成即回收**：job done 即移出台账，append-only 台账曾把 51 分钟/108 轮长会话在半路误掐（agent 空转 22 轮），复盘见 [治理文档](../docs/architecture/sandbox-governance.md) ③ workspace bootstrap（npm install 等）超时单独放宽 300s，用户工具默认 30s 不变 |
 | `dify_agent_runs_route.py` | `src/dify_agent/server/routes/runs.py`（114 → 188 行） | **并发闸门**：每用户同时运行 run 数上限 2（超限 429）、全局限 64；done_callback 释放计数，异常路径同步回滚 |
 
-与 `overrides` 配套的资源治理链条：**入口并发闸门（runs route）→ 执行中配额与 job 上限（shell layer）→ 超时与输出截断（官方机制 + bootstrap 放宽）**。
+与 `overrides` 配套的资源治理链条：**入口并发闸门（runs route）→ 执行中配额与未完成任务上限（shell layer）→ 超时与输出截断（官方机制 + bootstrap 放宽）→ 生命周期回收（gateway pause/resume + 闲置 reaper）**。
+
+## gateway/（自托管 E2B 式沙箱 Gateway）
+
+`gateway/gateway.py`（466 行，FastAPI + docker SDK）+ `Dockerfile`。把官方 enterprise 后端所期望的沙箱契约在自托管环境实现出来：**一租户一独立 docker 容器**（创建时落地 2 CPU / 2G 内存 / 256 进程数限额），**release 即 pause**（进程冻结、文件保留，等价 E2B `pause(keep_memory=True)`）、重连自动 resume、1h 闲置 reaper 兜底（只 pause 不销毁）、home 快照 ≤1GB 按租户命名空间隔离、`/proxy` 反向代理失败自动恢复重试。契约、安全细节与部署验证见 [`../docs/architecture/sandbox-governance.md`](../docs/architecture/sandbox-governance.md)。
 
 ## 为什么用 patch 形式
 

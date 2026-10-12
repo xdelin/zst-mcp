@@ -1,0 +1,74 @@
+diff --git a/dify-agent/src/dify_agent/runtime_backend/enterprise.py b/dify-agent/src/dify_agent/runtime_backend/enterprise.py
+index 6d038c4fe..3f04d81e1 100644
+--- a/dify-agent/src/dify_agent/runtime_backend/enterprise.py
++++ b/dify-agent/src/dify_agent/runtime_backend/enterprise.py
+@@ -226,6 +226,9 @@ class EnterpriseExecutionBindingBackend:
+         """Reconnect to one existing Gateway sandbox without creating a replacement."""
+         data_plane: ShellctlRuntimeLease | None = None
+         try:
++            # 学官方 E2B connect 的自动 resume：被 release/闲置兜底 pause 的沙箱
++            # 先恢复再建数据面，否则代理请求会等在冻结进程上直到超时。
++            _ = await self._resume_sandbox(binding_ref)
+             data_plane = await self._create_data_plane(binding_ref)
+             validation_commands = ShellctlCommands(client=data_plane.client)
+             result = await run_shellctl_control_command(
+@@ -257,13 +260,34 @@ class EnterpriseExecutionBindingBackend:
+             raise
+ 
+     async def release(self, lease: RuntimeLease) -> None:
+-        """Close operation-local shellctl resources without deleting the sandbox."""
++        """Close operation-local shellctl resources, then immediately pause the sandbox.
++
++        本地补丁：学官方 E2B（release 即 sandbox.pause(keep_memory=True)）。官方企业
++        客户端从不主动回收、只靠服务端过期；自托管 Gateway 的 pause 立即释放 CPU、
++        保留文件，重新接入自动恢复。失败仅告警——Gateway 的闲置兜底
++        （SBX_IDLE_PAUSE_SECONDS，官方同款 1h）是最终防线。
++        """
+         if not isinstance(lease, EnterpriseRuntimeLease):
+             raise TypeError("EnterpriseExecutionBindingBackend can only release its own RuntimeLease")
+         try:
+             await lease.data_plane.close()
+         except Exception as exc:
+             raise BindingAcquireError(str(exc)) from exc
++        try:
++            _ = await _gateway_request(
++                endpoint=self.gateway_endpoint,
++                auth_token=self.auth_token,
++                timeout=self.gateway_timeout,
++                method="POST",
++                path=f"/v1/sandboxes/{quote(lease.handle, safe='')}/pause",
++                json_body={},
++            )
++        except (_GatewayStatusError, httpx.TimeoutException, httpx.RequestError) as exc:
++            logger.warning(
++                "failed to pause Enterprise sandbox %s after release; the Gateway idle reaper will collect it",
++                lease.handle,
++                exc_info=True,
++            )
+ 
+     async def destroy_binding(self, spec: ExecutionBindingDestroySpec) -> None:
+         """Delete the coupled sandbox only when its Workspace is also retired."""
+@@ -289,6 +313,23 @@ class EnterpriseExecutionBindingBackend:
+             absent_status=404,
+         )
+ 
++    async def _resume_sandbox(self, sandbox_id: str) -> None:
++        try:
++            _ = await _gateway_request(
++                endpoint=self.gateway_endpoint,
++                auth_token=self.auth_token,
++                timeout=self.gateway_timeout,
++                method="POST",
++                path=f"/v1/sandboxes/{quote(sandbox_id, safe='')}/resume",
++                json_body={},
++            )
++        except _GatewayStatusError as exc:
++            if exc.status_code == HTTPStatus.NOT_FOUND:
++                raise BindingLostError(f"Enterprise Binding {sandbox_id!r} no longer exists") from exc
++            raise BindingAcquireError(f"failed to resume Enterprise sandbox {sandbox_id!r}: {exc}") from exc
++        except (httpx.TimeoutException, httpx.RequestError) as exc:
++            raise BindingAcquireError(f"failed to resume Enterprise sandbox {sandbox_id!r}: {exc}") from exc
++
+     async def _delete_sandbox_best_effort(self, sandbox_id: str) -> None:
+         try:
+             await self._delete_sandbox(sandbox_id)

@@ -54,7 +54,9 @@ BOOTSTRAP_TIMEOUT_SECONDS = 300.0
 # 本地补丁（假设终端用户不可信）：
 # 1. 每个 Binding（home + workspace）磁盘配额，防止 dd / 海量下载灌满宿主机磁盘。
 #    超配额本轮 run 直接失败并给出明确原因。
-# 2. 单轮 run 内 shell job 数上限，防止模型失控/恶意 prompt 一轮内海量起任务。
+# 2. 单轮 run 内未完成 shell job 数上限，防止模型失控/恶意 prompt 一轮内海量起任务。
+#    本地补丁：台账改为「完成即回收」——job 结束且观测交付后立即移出台账，
+#    上限只统计未完成任务（曾因 append-only 台账把 51 分钟长会话顶到上限报错）。
 _BINDING_DISK_QUOTA_MB = 2048
 _QUOTA_CHECK_TIMEOUT_SECONDS = 60.0
 _MAX_TRACKED_JOBS_PER_RUN = 32
@@ -108,6 +110,8 @@ Usage rules:
 
 - Start with shell_run.
 - If shell_run returns done=false, call shell_wait with the returned job_id.
+- A finished job (done=true) is released from tracking once its result is returned;
+  if you need its full output, read the returned output_path with a new shell_run.
 - Use shell_input only when the job is running and waiting for stdin.
 - Use shell_interrupt when a job is stuck or should be stopped.
 
@@ -352,12 +356,13 @@ class DifyShellLayer(PydanticAILayer[DifyShellLayerDeps, object, DifyShellLayerC
         """Start a shell job in the current workspace and return its output and status."""
 
         try:
-            # 本地补丁：单轮 job 数上限，超限返回错误 observation（不启动 job，不留泄漏）。
+            # 本地补丁：单轮未完成 job 数上限，超限返回错误 observation（不启动 job，不留泄漏）。
             if len(self.runtime_state.job_ids) >= _MAX_TRACKED_JOBS_PER_RUN:
                 return _tool_error_from_exception(
                     ValueError(
-                        f"shell job limit for this turn reached ({_MAX_TRACKED_JOBS_PER_RUN} tracked jobs); "
-                        "wait for or interrupt existing jobs before starting more"
+                        f"shell job limit for this turn reached ({_MAX_TRACKED_JOBS_PER_RUN} unfinished jobs); "
+                        "wait for existing jobs to finish (shell_wait) or interrupt them (shell_interrupt) "
+                        "before starting more"
                     )
                 )
             env = self._build_shell_command_env(include_agent_stub_env=True)
@@ -379,6 +384,10 @@ class DifyShellLayer(PydanticAILayer[DifyShellLayerDeps, object, DifyShellLayerC
                 self._job_agent_stub_tokens[result.job_id] = agent_stub_token
             else:
                 self._job_agent_stub_tokens.pop(result.job_id, None)
+            # 本地补丁：完成即回收。done 任务的结果已随本次 observation 交付，
+            # 续读截断输出走 output_path（新 shell_run cat），不依赖该 job 继续跟踪。
+            if result.done:
+                self._reclaim_finished_job(result.job_id)
             return _tagged_shell_observation(
                 _metadata_dict(
                     job_id=result.job_id,
@@ -411,8 +420,9 @@ class DifyShellLayer(PydanticAILayer[DifyShellLayerDeps, object, DifyShellLayerC
                 observation.text,
                 sensitive_values=(self._job_agent_stub_tokens.get(job_id),),
             )
+            # 本地补丁：完成即回收（同 shell_run）。
             if result.done:
-                self._job_agent_stub_tokens.pop(job_id, None)
+                self._reclaim_finished_job(job_id)
             return _tagged_shell_observation(
                 _metadata_dict(
                     job_id=result.job_id,
@@ -445,8 +455,9 @@ class DifyShellLayer(PydanticAILayer[DifyShellLayerDeps, object, DifyShellLayerC
                 observation.text,
                 sensitive_values=(self._job_agent_stub_tokens.get(job_id),),
             )
+            # 本地补丁：完成即回收（同 shell_run）。
             if result.done:
-                self._job_agent_stub_tokens.pop(job_id, None)
+                self._reclaim_finished_job(job_id)
             return _tagged_shell_observation(
                 _metadata_dict(
                     job_id=result.job_id,
@@ -475,6 +486,10 @@ class DifyShellLayer(PydanticAILayer[DifyShellLayerDeps, object, DifyShellLayerC
             self._remember_job_id(result.job_id)
             self._remember_job_offset(result.job_id, result.offset)
             self._job_agent_stub_tokens.pop(result.job_id, None)
+            # 本地补丁：interrupt 成功且 job 已终止即回收；grace 期内未终止则保持
+            # 跟踪，模型可用 shell_wait 等最终状态。
+            if result.done:
+                self._reclaim_finished_job(result.job_id)
             output_path: str | None = None
             try:
                 # Once the interrupt itself succeeds, resolving the output path is
@@ -566,7 +581,11 @@ class DifyShellLayer(PydanticAILayer[DifyShellLayerDeps, object, DifyShellLayerC
 
     def _ensure_tracked_job(self, job_id: str) -> None:
         if job_id not in self.runtime_state.job_ids:
-            raise ValueError(f"Unknown shell job id for this session: {job_id}.")
+            raise ValueError(
+                f"Unknown shell job id for this session: {job_id}. "
+                "Finished jobs are released from tracking once their result has been delivered; "
+                "run a new command if you need more output."
+            )
 
     def _tracked_offset(self, job_id: str) -> int:
         self._ensure_tracked_job(job_id)
@@ -581,6 +600,18 @@ class DifyShellLayer(PydanticAILayer[DifyShellLayerDeps, object, DifyShellLayerC
         job_offsets = dict(self.runtime_state.job_offsets)
         job_offsets[job_id] = offset
         self.runtime_state.job_offsets = job_offsets
+
+    def _reclaim_finished_job(self, job_id: str) -> None:
+        # 本地补丁：完成即回收。job_ids 曾是纯 append-only（仅会话挂起/删除时清空），
+        # 51 分钟 108 轮的 frog 会话在一轮内跑满 32 上限误报。回收只动台账；
+        # 容器内的 job 记录与输出文件保留（无害，随沙箱销毁一起清理）。
+        # 顺序敏感：模型开了 validate_assignment，job_offsets ⊆ job_ids 的不变量
+        # 在每次字段赋值时都会校验，必须先缩 offsets 再缩 ids，两个中间态才都合法。
+        job_offsets = dict(self.runtime_state.job_offsets)
+        job_offsets.pop(job_id, None)
+        self.runtime_state.job_offsets = job_offsets
+        self.runtime_state.job_ids = [j for j in self.runtime_state.job_ids if j != job_id]
+        self._job_agent_stub_tokens.pop(job_id, None)
 
     async def _delete_tracked_jobs_best_effort(self, job_ids: Sequence[str]) -> None:
         commands = self._require_resource().commands
