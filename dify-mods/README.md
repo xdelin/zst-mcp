@@ -31,11 +31,11 @@
 | `dify_agent_shell_layer.py` | `src/dify_agent/layers/shell/layer.py`（114→重命名扩展，+90 行差异） | ① 每个 Binding（home+workspace）**磁盘配额 2048MB**：`du -sm` 汇总校验，超限本轮 run 直接失败并给明确原因，context create / resume 双时机检查（防 dd/海量下载灌满宿主机）② **单轮 run 未完成 shell job 数上限 32**（防模型失控海量起任务）——**完成即回收**：job done 即移出台账，append-only 台账曾把 51 分钟/108 轮长会话在半路误掐（agent 空转 22 轮），复盘见 [治理文档](../docs/architecture/sandbox-governance.md) ③ workspace bootstrap（npm install 等）超时单独放宽 300s，用户工具默认 30s 不变 |
 | `dify_agent_runs_route.py` | `src/dify_agent/server/routes/runs.py`（114 → 188 行） | **并发闸门**：每用户同时运行 run 数上限 2（超限 429）、全局限 64；done_callback 释放计数，异常路径同步回滚 |
 
-与 `overrides` 配套的资源治理链条：**入口并发闸门（runs route）→ 执行中配额与未完成任务上限（shell layer）→ 超时与输出截断（官方机制 + bootstrap 放宽）→ 生命周期回收（gateway pause/resume + 闲置 reaper）**。
+与 `overrides` 配套的资源治理链条：**入口并发闸门（runs route）→ 执行中配额与未完成任务上限（shell layer）→ 超时与输出截断（官方机制 + bootstrap 放宽）→ 生命周期回收（gateway pause/resume + 两级闲置回收：1h pause → 24h stop）**。
 
 ## gateway/（自托管 E2B 式沙箱 Gateway）
 
-`gateway/gateway.py`（466 行，FastAPI + docker SDK）+ `Dockerfile`。把官方 enterprise 后端所期望的沙箱契约在自托管环境实现出来：**一租户一独立 docker 容器**（创建时落地 2 CPU / 2G 内存 / 256 进程数限额），**release 即 pause**（进程冻结、文件保留，等价 E2B `pause(keep_memory=True)`）、重连自动 resume、1h 闲置 reaper 兜底（只 pause 不销毁）、home 快照 ≤1GB 按租户命名空间隔离、`/proxy` 反向代理失败自动恢复重试。契约、安全细节与部署验证见 [`../docs/architecture/sandbox-governance.md`](../docs/architecture/sandbox-governance.md)。
+`gateway/gateway.py`（518 行，FastAPI + docker SDK）+ `Dockerfile`。把官方 enterprise 后端所期望的沙箱契约在自托管环境实现出来：**一租户一独立 docker 容器**（创建时落地 2 CPU / 2G 内存 / 256 进程数限额），**release 即 pause**（进程冻结、文件保留，等价 E2B `pause(keep_memory=True)`）、重连自动 resume、**两级闲置回收**（1h pause → 24h stop 释放内存，文件保留、销毁只走客户端 DELETE，reaper 带 resume 竞态防护）、每沙箱独立 shellctl token（沙箱内不出现网关控制面密钥）、home 快照 ≤1GB 按租户命名空间隔离、`/proxy` 反向代理失败自动恢复重试。契约、安全细节与部署验证见 [`../docs/architecture/sandbox-governance.md`](../docs/architecture/sandbox-governance.md)。
 
 ## 为什么用 patch 形式
 

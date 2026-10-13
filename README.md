@@ -15,7 +15,8 @@ Dify 主 api（应用/会话/模型/知识库）     →     dify-mods/patches�
 dify-agent server（pydantic-ai 分层、   →     dify-mods/overrides：并发闸门、
   沙箱多后端 + lease、Redis run store)         磁盘配额 2GB、未完成 job 上限、复读熔断
 沙箱（local/e2b + SSRF 代理）           →     自托管沙箱 Gateway：一租户一容器、
-                                              release 即 pause / 自动 resume、限额
+                                              release 即 pause / 自动 resume、
+                                              闲置两级回收（1h pause → 24h stop）、限额
 云端 CLI 技能市场（2063 个）             →     skills-catalog/：筛选/分类/去重/
                                               描述重写 → 248 精选技能库
 ```
@@ -27,7 +28,7 @@ dify-agent server（pydantic-ai 分层、   →     dify-mods/overrides：并发
 
 | 模块 | 内容 | 规模 | 协议/端口 |
 |---|---|---|---|
-| `dify-mods/` | 对官方运行时的二次开发：11 个补丁（+656 行，patch 形式）+ 2 个资源治理覆盖文件 + 自托管 E2B 式沙箱 Gateway（单租户容器 / pause-resume / 限额） | ~1300 行增量 | 8100 |
+| `dify-mods/` | 对官方运行时的二次开发：11 个补丁（+656 行，patch 形式）+ 2 个资源治理覆盖文件 + 自托管 E2B 式沙箱 Gateway（单租户容器 / pause-resume / 两级闲置回收 / 限额） | ~1350 行增量 | 8100 |
 | `usermem/` | 跨会话用户记忆服务（MCP + REST 双协议） | ~1200 行 Node.js | 8083 |
 | `ppt-judge/` | PPT 评审 MCP（LibreOffice 转换 + LLM 评审 + 标注图） | ~1000 行 Python | 8003 |
 | `fogsight/` | 互动教学动画生成 MCP 封装层（引擎为开源改造，见归属声明）+ 自研 SVG 文本坐标编辑器（文本重叠检测/修复） | 封装层 ~700 行 + 编辑器 ~840 行 | 8001 |
@@ -46,7 +47,8 @@ Dify 主 api（底座）── 个人补丁：记忆身份注入 / 多模态历�
 dify-agent server（底座）── 个人补丁：复读熔断 / run_failed 兜底 / 文件通道
    │  并发闸门（每用户 2 run，429）
    ├── shell layer ── 个人补丁：磁盘配额 2GB + 未完成 job 上限 32（完成即回收）
-   ├── 沙箱 Gateway（自托管，个人实现）── 一租户一容器 / release 即 pause / 自动 resume / 限额
+   ├── 沙箱 Gateway（自托管，个人实现）── 一租户一容器 / release 即 pause / 自动 resume
+   │   │                                  / 闲置两级回收（1h pause → 24h stop）/ 限额
    │   └── dify-sbx-* 容器（镜像 local sandbox + SSRF 代理出网）
    └── MCP 工具集（28 个）
        ├── usermem        跨会话记忆：按用户隔离 + cron 主动任务

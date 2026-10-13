@@ -12,9 +12,9 @@
 | 触发上限 | 单轮 run shell job 台账上限 32（`_MAX_TRACKED_JOBS_PER_RUN`） |
 | 修复方式 | 台账「完成即回收」——shell_run / shell_wait / shell_interrupt 三处观察点，done 即移出台账 |
 | 沙箱形态 | 一租户一独立 docker 容器（`dify-sbx-<uuid>`），创建时落地限额：2 CPU / 2G 内存 / 256 进程数 |
-| 生命周期 | release 即 pause（进程冻结、文件保留，等价 E2B `pause(keep_memory=True)`）；重连自动 resume；1h 闲置 reaper 兜底 |
+| 生命周期 | release 即 pause（进程冻结、文件保留，等价 E2B `pause(keep_memory=True)`）；重连自动 resume；闲置两级回收：1h pause → 24h stop 释放内存（文件保留），销毁只走客户端 DELETE |
 | 活跃容量 | 同时运行沙箱 ≤100（paused 不占名额）；home 快照 ≤1GB、按租户命名空间隔离 |
-| 代码规模 | shell layer 覆盖文件 836 行（upstream 114 行）；Gateway 466 行；enterprise 客户端补丁 +42 行 + 单测 +69 行 |
+| 代码规模 | shell layer 覆盖文件 836 行（upstream 114 行）；Gateway 518 行；enterprise 客户端补丁 +42 行 + 单测 +69 行 |
 
 ## 治理链条总览
 
@@ -27,7 +27,7 @@
         ↓                              单轮未完成 shell job ≤32（完成即回收）
 超时与截断（官方机制）                  用户工具 30s，bootstrap 放宽 300s
         ↓
-生命周期回收（自托管 Gateway）          release 即 pause / 闲置 1h reaper / 快照按租户隔离
+生命周期回收（自托管 Gateway）          release 即 pause / 闲置 1h pause → 24h stop / 快照按租户隔离
 ```
 
 ## 事故复盘：51 分钟会话被自己的安全阀掐断
@@ -77,7 +77,7 @@ wait for or interrupt existing jobs before starting more
 
 ### Gateway 契约（客户端代码即规格书）
 
-`docker/gateway/gateway.py`（466 行，FastAPI + docker SDK）严格实现 `runtime_backend/enterprise.py` 客户端所期望的契约：
+`docker/gateway/gateway.py`（518 行，FastAPI + docker SDK）严格实现 `runtime_backend/enterprise.py` 客户端所期望的契约：
 
 | 端点 | 语义 |
 |---|---|
@@ -93,15 +93,16 @@ wait for or interrupt existing jobs before starting more
 
 - **release 即 pause**：`docker pause`（SIGSTOP 冻结进程）——文件保留、内存保留、CPU 归零，等价 E2B `pause(keep_memory=True)`。pause 不销毁，重连即恢复。
 - **重连自动 resume**：acquire 路径先调 `/resume` 再建数据面（学官方 E2B connect 的自动恢复）；`/proxy` 请求失败时也 resume 后重试一次——被 pause 的沙箱对客户端几乎透明。
-- **闲置 reaper 只是兜底**：`SBX_IDLE_PAUSE_SECONDS=3600`（与官方 `E2B_MAX_ACTIVE_TIMEOUT_SECONDS` 同款 1h）只处理 release 未触达的情况（进程崩溃/网关丢调用），且同样只 pause 不销毁。
-- **容量口径**：活跃上限 100 只数 running 容器，paused 不占名额——pause 正是容量回收的手段。
+- **闲置两级回收**：第一档 `SBX_IDLE_PAUSE_SECONDS=3600`（与官方 `E2B_MAX_ACTIVE_TIMEOUT_SECONDS` 同款 1h）处理 release 未触达的情况（进程崩溃/网关丢调用），只 pause 不销毁。第二档 `SBX_IDLE_STOP_SECONDS=86400`（累计闲置 24h，含已 pause 时段）把 paused 沙箱 unpause 后 stop——pause 的 cgroup freezer 仍占内存，stop 才把 RAM 真正归还宿主机；文件保留在容器可写层，用户回来走既有 `/resume` 冷启动（~1-2s）。reaper 视野相应从 running 扩到 running+paused。销毁仍只走客户端 DELETE，reaper 永不销毁。
+- **回收竞态防护**：reaper 判定与执行之间若 `last_seen` 变化（客户端刚 resume），本轮放弃、下轮再判——不误回收刚回来的沙箱。
+- **容量口径**：活跃上限 100 只数 running 容器，paused/stopped 不占名额——pause/stop 正是容量回收的手段。
 - **对齐客户端错误判定**：未知/已销毁沙箱返回 `404 + code=sandbox_not_found`，与客户端 `_is_missing_sandbox` 的 BindingLost 判定一致，租约状态机不会悬挂。
 
 ### 资源限额与安全细节
 
 - **容器创建时落地限额**：`mem_limit=2G`、`nano_cpus=2`、`pids_limit=256`——单租户失控最多烧掉自己的份额，伤不到宿主机与其他租户。
 - **快照租户命名空间隔离**：快照 ref 强制为 `{tenantId}.{homeSnapshotId}`，租户段禁止点号；不同租户传相同 snapshotId 不会互相覆盖/窃取。写入走 tmp+rename 原子替换。
-- **双层鉴权**：外部只持 `X-Inner-Api-Key`；沙箱内 shellctl 的 Bearer token 由 Gateway 创建容器时注入、代理时统一附上——客户端全程不感知内层 token。
+- **双层鉴权 + 每沙箱独立 token**：外部只持 `X-Inner-Api-Key`；每个沙箱创建时注入独立的 shellctl token（`secrets.token_hex(32)`，学官方 E2B `traffic_access_token`），`/proxy` 按沙箱注入 Bearer——沙箱内不出现网关控制面密钥，被攻破的沙箱横向访问不了其他租户沙箱或网关 API。转发实现踩过一个真实坑：Starlette headers 迭代出的都是小写键，混用大小写键重建会出现两个 `Authorization`，shellctl 读到的是调用方的网关密钥导致 401——`/proxy` 现在显式剥离调用方 `Authorization` 后以小写键重建。
 - **出网管控**：沙箱 HTTP(S)_PROXY 指向专用 SSRF 代理容器，与 Dify 官方沙箱共用出口策略。
 - **重启不丢账**：Gateway 以 docker label（sandbox-id / tenant-id）登记，启动时按 label 对账重建注册表；强删 paused 容器前先 unpause（docker 拒绝删除 paused 容器）。
 
@@ -111,7 +112,7 @@ wait for or interrupt existing jobs before starting more
 
 ### 部署验证
 
-自托管华为鲲鹏内网机实测：Gateway 容器运行中；两个按租户创建的 `dify-sbx-<uuid>` 容器，其一在 release 后处于 `Paused` 状态——pause/resume 链路真实生效。
+自托管华为鲲鹏内网机实测：Gateway 容器运行中；两个按租户创建的 `dify-sbx-<uuid>` 容器，其一在 release 后处于 `Paused` 状态——pause/resume 链路真实生效。两级闲置回收随 2026-10-12 镜像重建生效；24h 档是渐进兜底，生产暂无触发记录（预期行为：首次请求经 `/proxy` 自动 resume 冷启动恢复）。
 
 ## 关联
 

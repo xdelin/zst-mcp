@@ -13,10 +13,15 @@
 
 核心承诺：一个 Binding = 一个独立 docker 容器——CPU/内存/进程数限额在容器
 创建时落地（per-tenant 隔离），快照是租户资产，沙箱是易耗品。
+每沙箱独立 shellctl token（学官方 E2B traffic_access_token）：Gateway 建容器时
+生成随机 token 注入并在 /proxy 按沙箱注入 Bearer；沙箱内不出现网关控制面密钥
+（X-Inner-Api-Key），防被攻破的沙箱横向访问其他租户沙箱或网关 API。
 生命周期学官方 E2B：release 即 pause（进程冻结、文件保留、不占 CPU，等价
 E2B pause(keep_memory=True)），重新接入自动恢复；SBX_IDLE_PAUSE_SECONDS
 （官方同款 1h = E2B_MAX_ACTIVE_TIMEOUT_SECONDS）只是 release 未触达时的
-防泄漏兜底，pause 不销毁。未知/已销毁沙箱的代理请求返回
+防泄漏兜底，pause 不销毁。二级回收：闲置 ≥ SBX_IDLE_STOP_SECONDS（默认 24h，
+含已 pause 的沙箱）被 stop 释放内存——文件仍保留，/resume 冷启动（~1-2s）恢复，
+销毁仍只走客户端 DELETE。未知/已销毁沙箱的代理请求返回
 404 + code=sandbox_not_found，与客户端 _is_missing_sandbox 的 BindingLost 判定对齐。
 """
 from __future__ import annotations
@@ -27,6 +32,7 @@ import io
 import logging
 import os
 import re
+import secrets
 import time
 import uuid
 from pathlib import Path
@@ -56,6 +62,9 @@ SBX_START_TIMEOUT = float(os.environ.get("SBX_START_TIMEOUT", "60"))
 # 学官方 E2B：闲置超时只 pause 不销毁（on_timeout="pause"），默认 3600s 即官方
 # E2B_MAX_ACTIVE_TIMEOUT_SECONDS。仅作 release 未触达（进程崩溃/网关丢调用）的兜底。
 SBX_IDLE_PAUSE_SECONDS = float(os.environ.get("SBX_IDLE_PAUSE_SECONDS", "3600"))
+# 二级回收：闲置超过该秒数的挂起沙箱被 stop 释放内存（文件保留，下次 /resume
+# 冷启动 ~1-2s；到这个深度的后台 job 早已弃置）。默认 24h，防弃用会话渐近占满内存。
+SBX_IDLE_STOP_SECONDS = float(os.environ.get("SBX_IDLE_STOP_SECONDS", "86400"))
 SBX_HTTP_PROXY = os.environ.get("SBX_HTTP_PROXY", "http://agent_ssrf_proxy:3128")
 GATEWAY_TOKEN = os.environ.get("GATEWAY_INNER_API_KEY", "")
 SNAPSHOT_ROOT = Path(os.environ.get("SBX_SNAPSHOT_ROOT", "/snapshots"))
@@ -106,6 +115,14 @@ def _container_name(sandbox_id: str) -> str:
     return f"dify-sbx-{sandbox_id}"
 
 
+def _shellctl_token(container: Container) -> str:
+    """Recover a sandbox's own shellctl token from its container env."""
+    for entry in (container.attrs.get("Config", {}) or {}).get("Env") or []:
+        if isinstance(entry, str) and entry.startswith("SHELLCTL_AUTH_TOKEN="):
+            return entry.split("=", 1)[1]
+    return GATEWAY_TOKEN
+
+
 def _reconcile() -> None:
     """Boot 后按 label 对账：Gateway 重启不丢沙箱登记。"""
     _registry.clear()
@@ -117,6 +134,7 @@ def _reconcile() -> None:
                 "tenant": c.labels.get(LABEL_TENANT, ""),
                 "created_at": c.attrs.get("Created", ""),
                 "last_seen": time.monotonic(),
+                "token": _shellctl_token(c),
             }
     logger.info("reconciled %d live sandboxes", len(_registry))
 
@@ -143,9 +161,11 @@ def _destroy_container_blocking(container: Container) -> None:
     container.remove(force=True)
 
 
-def _create_container_blocking(sandbox_id: str, tenant_id: str, snapshot_tar: bytes | None) -> Container:
+def _create_container_blocking(
+    sandbox_id: str, tenant_id: str, snapshot_tar: bytes | None, shellctl_token: str
+) -> Container:
     name = _container_name(sandbox_id)
-    env = {"SHELLCTL_AUTH_TOKEN": GATEWAY_TOKEN}
+    env = {"SHELLCTL_AUTH_TOKEN": shellctl_token}
     if SBX_HTTP_PROXY:
         env.update({"HTTP_PROXY": SBX_HTTP_PROXY, "HTTPS_PROXY": SBX_HTTP_PROXY, "NO_PROXY": "localhost,127.0.0.1"})
     host_config = docker_client.api.create_host_config(
@@ -189,11 +209,15 @@ async def _wait_shellctl_healthy(container: Container) -> None:
 
 
 def _reap_once() -> None:
-    """学官方 E2B 活跃超时：仍在运行的沙箱闲置超过阈值就 pause（不销毁）。"""
+    """两级闲置回收：运行沙箱闲置 ≥ SBX_IDLE_PAUSE_SECONDS 先 pause；
+    闲置 ≥ SBX_IDLE_STOP_SECONDS（含已 pause 的）stop 释放内存（文件保留）。"""
     now = time.monotonic()
-    for c in docker_client.containers.list(filters={"label": LABEL_SANDBOX, "status": "running"}):
+    for c in docker_client.containers.list(all=True, filters={"label": LABEL_SANDBOX}):
         sid = c.labels.get(LABEL_SANDBOX)
         if not sid:
+            continue
+        status = c.status
+        if status not in ("running", "paused"):
             continue
         info = _registry.get(sid)
         if info is None:
@@ -202,14 +226,29 @@ def _reap_once() -> None:
                 "tenant": c.labels.get(LABEL_TENANT, ""),
                 "created_at": c.attrs.get("Created", ""),
                 "last_seen": now,
+                "token": _shellctl_token(c),
             }
             continue
         last = info.get("last_seen")
         if not isinstance(last, float):
             info["last_seen"] = now
             continue
-        if now - last >= SBX_IDLE_PAUSE_SECONDS:
-            logger.info("reaper: pausing idle sandbox %s (idle %.0fs)", sid, now - last)
+        idle = now - last
+        if idle < SBX_IDLE_PAUSE_SECONDS:
+            continue
+        # 判定与执行之间客户端可能刚 resume：last_seen 变了就放弃本轮，下轮再判
+        if info.get("last_seen") != last:
+            continue
+        if idle >= SBX_IDLE_STOP_SECONDS:
+            logger.info("reaper: stopping idle sandbox %s (idle %.0fs) to release memory", sid, idle)
+            try:
+                if status == "paused":
+                    c.unpause()
+                c.stop(timeout=10)
+            except Exception:
+                logger.exception("reaper: failed to stop sandbox %s", sid)
+        elif status == "running":
+            logger.info("reaper: pausing idle sandbox %s (idle %.0fs)", sid, idle)
             try:
                 c.pause()
             except Exception:
@@ -314,8 +353,12 @@ async def create_sandbox(request: Request) -> JSONResponse:
         return _err(429, "sandbox_capacity_reached", f"active sandbox limit ({SBX_MAX_ACTIVE}) reached, retry later")
 
     sandbox_id = uuid.uuid4().hex
+    # 每沙箱独立 shellctl token：与网关控制面密钥无关，防横向（学 E2B traffic_access_token）
+    shellctl_token = secrets.token_hex(32)
     try:
-        container = await run_in_threadpool(_create_container_blocking, sandbox_id, tenant_id, snapshot_tar)
+        container = await run_in_threadpool(
+            _create_container_blocking, sandbox_id, tenant_id, snapshot_tar, shellctl_token
+        )
         await _wait_shellctl_healthy(container)
     except OverflowError:
         return _err(413, "snapshot_too_large", f"home snapshot exceeds {SBX_SNAPSHOT_MAX_MB}MB")
@@ -335,6 +378,7 @@ async def create_sandbox(request: Request) -> JSONResponse:
         "tenant": tenant_id,
         "created_at": "",
         "last_seen": time.monotonic(),
+        "token": shellctl_token,
     }
     logger.info("sandbox %s created for tenant %s (snapshot=%s)", sandbox_id, tenant_id, snapshot_ref)
     return JSONResponse({"sandboxId": sandbox_id})
@@ -432,11 +476,19 @@ async def proxy(rest: str, request: Request) -> Response:
     target = f"http://{info['name']}:{SBX_SHELLCTL_PORT}/{rest}"
     if request.url.query:
         target += f"?{request.url.query}"
-    headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_HEADERS}
-    # 沙箱内 shellctl 的 Bearer 由 Gateway 统一注入：企业客户端只持 X-Inner-Api-Key，
-    # 不感知 shellctl token；容器创建时已注入同名 token，双层对齐。
-    if GATEWAY_TOKEN:
-        headers["Authorization"] = f"Bearer {GATEWAY_TOKEN}"
+    # 剥掉调用方的 Authorization（企业客户端带的是网关密钥，不能透传给沙箱），
+    # 再以小写键重建——Starlette headers 迭代出的都是小写，混用大小写键会出现
+    # 两个 Authorization，shellctl 读到的是调用方的那个导致 401。
+    headers = {
+        k: v
+        for k, v in request.headers.items()
+        if k.lower() not in _HOP_HEADERS and k.lower() != "authorization"
+    }
+    # 沙箱内 shellctl 的 Bearer 由 Gateway 按沙箱注入独立 token：企业客户端只持
+    # X-Inner-Api-Key，不感知 shellctl token；沙箱内也没有网关控制面密钥。
+    shellctl_token = info.get("token") or GATEWAY_TOKEN
+    if shellctl_token:
+        headers["Authorization"] = f"Bearer {shellctl_token}"
     body = await request.body()
     assert proxy_client is not None
     try:
