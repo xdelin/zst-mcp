@@ -45,20 +45,20 @@ wait for or interrupt existing jobs before starting more
 
 ### 根因：上限的语义与实现不符
 
-`_MAX_TRACKED_JOBS_PER_RUN = 32` 是 9/25 加的本地安全补丁（配套每 Binding 2GB 磁盘配额），本意是「防止模型失控/恶意 prompt 一轮内海量**起**任务」——语义上是**并发**上限。但实现上：
+`_MAX_TRACKED_JOBS_PER_RUN = 32` 是 9/25 加的本地安全补丁（配套每 Binding 2GB 磁盘配额），**原始意图是给单个 run 的 agent loop 设资源预算**：模型偶尔会陷入「无限干活」模式——反复跑命令、烧 token、占着沙箱，需要一个每 run 的硬上限让 loop 停得下来。在这个「限制本轮总工作量」的语义下，append-only 台账本来就是自洽实现。事后复盘才看清问题：**真正要防的失控（死循环海量起任务）是「并发」概念，而预算限的是「累计」——两个语义在加补丁那天就悄悄脱节了**：
 
-1. **job 台账是 append-only 的**：只在轮次结束时整体清空，已完成的 job 不会被中途回收。于是 32 实际上是「本轮 shell 命令**累计总数**上限」，与任务是否还活着无关。
+1. **job 台账是 append-only 的**：只在轮次结束时整体清空，已完成的 job 不会被中途回收。于是 32 实际上是「本轮 shell 命令**累计总数**上限」，与任务是否还活着无关——预算语义本身自洽，但对动辄上百条命令的正常长任务（装依赖 + 跑测试 + 渲染产物的组合），这个预算定得太低。
 2. **错误信息的补救建议是假的**：提示 wait/interrupt，但这两个操作都不改变台账。agent 忠实地执行建议，结果是被永久卡死——错误处理路径反而放大了事故（22 轮无效重试）。
-3. **受影响任务类别很典型**：任何超过 32 条 shell 命令的长任务（装依赖 + 跑测试 + 渲染产物的组合）都会在半路被掐。短会话形态永远踩不到，所以此前的 18 项故障注入回归集（全部短会话）没有拦住它。
+3. **受影响任务类别很典型**：任何超过 32 条 shell 命令的长任务都会在半路被掐。短会话形态永远踩不到，所以此前的 18 项故障注入回归集（全部短会话）没有拦住它。
 
-一句话：**安全阀的本意是限「水位」，实现却限了「流量」——而错误信息还谎报了排水方法。**
+一句话：**安全阀按「预算」设计、以「累计」落地，而真正要防的失控是「水位」——语义错了层，错误信息还谎报了排水方法。**
 
 ### 修复：完成即回收（保持防失控语义）
 
-最小改动原则：不动并发保护本身，只让台账反映真实水位。
+最小改动原则：不删上限、不加新机制，只让台账反映真实水位——上限语义从「本轮总预算」重定义为「未完成并发上限」。
 
 - **三处观察点回收**：`shell_run` / `shell_wait` / `shell_interrupt` 观察到 job `done=true`（结果已随本次 observation 交付）即移出台账；`shell_interrupt` 后仍在 grace 期未终止的 job 保持跟踪，等 `shell_wait` 观察终态。
-- **上限语义归位**：32 只统计**未完成**任务——32 个同时活跃的恶意任务照样被挡住，长任务不再被误伤。
+- **上限语义重定义**：32 只统计**未完成**任务——32 个同时活跃的失控任务照样被挡住，长任务不再被误伤。取舍：改成并发语义后，「海量廉价命令」式的跑量不再被这个上限拦——但该类失控有别的兜底（单任务 300s 超时、磁盘配额、失败按周归因监控），跑量可见可加护栏，而误杀是用户直接可感的交付失败。
 - **错误信息改为真话**：`32 unfinished jobs; wait for existing jobs to finish (shell_wait) or interrupt them (shell_interrupt)`——建议与系统行为一致。
 - **prompt 契约同步**：shell 工具使用说明中加入「finished job is released from tracking once its result is returned; read the returned `output_path` with a new shell_run if you need its full output」——模型被告知续读截断输出的正确姿势（新起 `shell_run` cat `output_path`），不依赖已回收的 job。
 - **未知 job 的报错也带解释**：`_ensure_tracked_job` 对已回收 job 报「Finished jobs are released from tracking once their result has been delivered; run a new command if you need more output」。
