@@ -473,6 +473,9 @@ async def proxy(rest: str, request: Request) -> Response:
     info = _registry.get(sandbox_id)
     if info is None:
         return _err(404, "sandbox_not_found", f"unknown sandbox {sandbox_id!r}")
+    # 代理流量即心跳：每个到达的请求都刷新水位线。否则 last_seen 停在创建/恢复
+    # 时刻，持续超过 1h 的活跃会话会被 reaper 误判闲置，在 run 中途被 pause 掐停。
+    info["last_seen"] = time.monotonic()
     target = f"http://{info['name']}:{SBX_SHELLCTL_PORT}/{rest}"
     if request.url.query:
         target += f"?{request.url.query}"
@@ -503,7 +506,6 @@ async def proxy(rest: str, request: Request) -> Response:
         if resume_error is not None:
             status, message = resume_error
             return _err(status, "sandbox_not_found" if status == 404 else "sandbox_unreachable", message)
-        info["last_seen"] = time.monotonic()
         try:
             upstream = await proxy_client.request(
                 request.method, target, headers=headers, content=body, follow_redirects=False

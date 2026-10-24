@@ -94,6 +94,7 @@ wait for or interrupt existing jobs before starting more
 - **release 即 pause**：`docker pause`（SIGSTOP 冻结进程）——文件保留、内存保留、CPU 归零，等价 E2B `pause(keep_memory=True)`。pause 不销毁，重连即恢复。
 - **重连自动 resume**：acquire 路径先调 `/resume` 再建数据面（学官方 E2B connect 的自动恢复）；`/proxy` 请求失败时也 resume 后重试一次——被 pause 的沙箱对客户端几乎透明。
 - **闲置两级回收**：第一档 `SBX_IDLE_PAUSE_SECONDS=3600`（与官方 `E2B_MAX_ACTIVE_TIMEOUT_SECONDS` 同款 1h）处理 release 未触达的情况（进程崩溃/网关丢调用），只 pause 不销毁。第二档 `SBX_IDLE_STOP_SECONDS=86400`（累计闲置 24h，含已 pause 时段）把 paused 沙箱 unpause 后 stop——pause 的 cgroup freezer 仍占内存，stop 才把 RAM 真正归还宿主机；文件保留在容器可写层，用户回来走既有 `/resume` 冷启动（~1-2s）。reaper 视野相应从 running 扩到 running+paused。销毁仍只走客户端 DELETE，reaper 永不销毁。
+- **代理流量即心跳**：`/proxy` 每个请求入口刷新 `last_seen`（曾只在 resume 分支刷新——修复前持续超过 1h 的活跃会话水位线停在创建时刻，会被 reaper 误判闲置、run 中途被 pause 掐停）。
 - **回收竞态防护**：reaper 判定与执行之间若 `last_seen` 变化（客户端刚 resume），本轮放弃、下轮再判——不误回收刚回来的沙箱。
 - **容量口径**：活跃上限 100 只数 running 容器，paused/stopped 不占名额——pause/stop 正是容量回收的手段。
 - **对齐客户端错误判定**：未知/已销毁沙箱返回 `404 + code=sandbox_not_found`，与客户端 `_is_missing_sandbox` 的 BindingLost 判定一致，租约状态机不会悬挂。
