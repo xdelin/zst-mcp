@@ -2,7 +2,7 @@
 
 把 `dify-mods/` 的 9 个补丁 + 2 个 override 转成可自动重放的断言用例，故障注入式验证补丁行为在位、可运行、防升级失效。
 
-## 用例清单（18 项，首轮 ALL GREEN）
+## 用例清单（cases/，18 项，首轮 ALL GREEN）
 
 | 级别 | 用例 | 断言内容 | 对应补丁 |
 |---|---|---|---|
@@ -23,6 +23,18 @@
 
 「在位」断言针对 override 的最大风险：**Dify 升级后挂载路径/文件名变化导致覆盖静默失效**。
 
+## 三桶测试集（three-bucket/，沙箱治理）
+
+`three-bucket/` 镜像服务器 dify 仓库 `docker/gateway` + `docker/patches` 的沙箱治理回归三桶，与上面 18 项互补——18 项覆盖 api / dify-agent 补丁本身，三桶覆盖**沙箱治理链路**（gateway + runs 闸门 + shell 层）：
+
+| 桶 | 内容 | 运行时机 |
+|---|---|---|
+| easy | `gateway/regression.sh`：在位 9 项（容器/补丁挂载/环境注入/快照卷/双网络/健康页）+ 功能 10 项（401/create/proxy/pause 幂等/resume/stop 后自动恢复/销毁后 404；真栈单点调用，regression-easy 临时租户必清理） | 每次跑 |
+| hard | `gateway/test_gateway_hard.py`（容量 429 / paused 不占名额 / release→pause 幂等 / resume 刷 last_seen，20 断言）+ `patches/test_runs_gate_hard.py`（每用户 2 / 全局 64 闸门、释放幂等、异常回滚、缺 context 落共享键，8 用例）+ `patches/test_shell_layer_hard.py`（配额脚本结构与触发、job 上限 32 不泄漏、完成即回收、台账不变量，11 用例）——全部假件、确定性，不碰真沙箱 | 每次跑/每夜 |
+| black-box | `gateway/BLACKBOX.md`：真 3 并发 run（闸门+容量+release 生命周期全链路）、真 2GB 内存限额（磁盘配额顺带） | 升级节点手动 |
+
+一键入口 `three-bucket/gateway/run_regression.sh`（easy + hard，退出码聚合；black-box 只打印提醒）。首轮实跑全绿：**easy 19 / gateway hard 20 / agent_backend hard 19**。hard 桶的两个关键回归形状：`test_limit_counts_only_unfinished_jobs` 即 51 分钟长会话误掐事故的复现（32 满→wait 回收→放行→再满→再拦）；闸门用例覆盖「拒绝不污染计数 / 双回调幂等 / 快完成同步释放 / 异常回滚」。
+
 ## 运行
 
 ```bash
@@ -36,5 +48,5 @@ runner 通过 `docker exec -i` 把用例脚本送入 `docker-agent_backend-1` / 
 ## 设计取舍
 
 - **单元级优先**：直接 import 容器内挂载生效的补丁代码构造输入断言行为，不依赖模型调用，结果确定性 100%；
-- **429 并发闸门的黑盒用例**（真实创建 3 个并发 run 断言第 3 个 429）暂不纳入自动集——需要真实 composition 与模型调用，作为手动验证项；
-- **磁盘配额实际灌盘**（>2GB 触发拦截）同样留作手动验证，避免在共享宿主机上写大文件。
+- **429 并发闸门**：决策逻辑已由三桶 hard 的假件单测覆盖（`test_runs_gate_hard.py`，预置台账 + 假调度器）；真 3 并发全链路接线留 black-box 桶（BLACKBOX.md 黑盒 1，升级节点手动）；
+- **磁盘配额实际灌盘**（>2GB 触发拦截）留 black-box 桶（BLACKBOX.md 黑盒 2）；配额**决策逻辑**已由 hard 桶覆盖（假 commands 注入 exit_code，无需真 2GB 文件）。

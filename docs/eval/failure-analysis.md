@@ -26,7 +26,7 @@
 | plugin_daemon_error | 2 | 2.9% | 插件守护进程 | — |
 | config_validation | 1 | 1.4% | 配置 | — |
 | rate_limit_triggered（Agent backend HTTP 429） | 1 | 1.4% | 运行时 | **并发闸门 patch 按预期触发（防护证据，非故障）** |
-| agent_retry_exhausted | 1 | 1.4% | agent 运行时 | — |
+| agent_retry_exhausted | 1 | 1.4% | agent 运行时 | 根因已被 model 补丁 `_ensure_actionable_output` 兜底覆盖（思考-only 输出 → 输出重试耗尽 → UnexpectedModelBehavior 整轮报废 → 注入兜底正文）；样本仅 1 条、无周趋势，只声明「根因已覆盖」不声明「归零」 |
 | unknown | 1 | 1.4% | — | — |
 
 归因合计：本人负责域（运行时 + MCP 基础设施）35 条（50.7%），上游模型服务 23 条（33.3%），配置/其他 11 条（15.9%）。
