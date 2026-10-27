@@ -1,16 +1,17 @@
 diff --git a/dify-agent/src/dify_agent/adapters/llm/model.py b/dify-agent/src/dify_agent/adapters/llm/model.py
-index 1f4c93a16..357ad5a6f 100644
+index 1f4c93a16..f8d182986 100644
 --- a/dify-agent/src/dify_agent/adapters/llm/model.py
 +++ b/dify-agent/src/dify_agent/adapters/llm/model.py
-@@ -10,6 +10,7 @@ and reads that accumulated usage after all model/tool rounds finish.
+@@ -10,6 +10,8 @@ and reads that accumulated usage after all model/tool rounds finish.
  from __future__ import annotations
  
  import base64
 +import logging
++import os
  import re
  from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
  from contextlib import asynccontextmanager
-@@ -76,6 +77,33 @@ _THINK_START = "<think>\n"
+@@ -76,6 +78,47 @@ _THINK_START = "<think>\n"
  _THINK_END = "\n</think>"
  _THINK_OPEN_TAG = "<think>"
  _THINK_CLOSE_TAG = "</think>"
@@ -23,6 +24,20 @@ index 1f4c93a16..357ad5a6f 100644
 +# （切片末尾由同一短单元连续重复 >= 熔断阈值次即判复读）
 +_THINK_PERIODIC_MIN_LEN = 64
 +_THINK_PERIODIC_MAX_UNIT = 64
++
++# 结构化 thinking（端到端独立字段通路）：思考以 chunk delta.reasoning_content 下发，
++# 不再嵌入 <think> 标签文本。仅对声明支持原生 reasoning_content 的供应商注入开关参数，
++# 插件（tongyi）据此切换输出通路，其他调用方不受影响。
++_THINKING_OUTPUT_PARAMETER = "thinking_output"
++_THINKING_OUTPUT_STRUCTURED = "structured"
++_DEFAULT_STRUCTURED_THINKING_PROVIDERS = "langgenius/tongyi/tongyi"
++
++
++def _structured_thinking_providers() -> frozenset[str]:
++    raw = os.environ.get("DIFY_AGENT_STRUCTURED_THINKING_PROVIDERS", "").strip()
++    if not raw:
++        raw = _DEFAULT_STRUCTURED_THINKING_PROVIDERS
++    return frozenset(item.strip() for item in raw.split(",") if item.strip())
 +
 +
 +def _periodic_repeat_count(text: str) -> int:
@@ -44,7 +59,25 @@ index 1f4c93a16..357ad5a6f 100644
  _THINK_TAG_PATTERN = re.compile(r"<think>(.*?)</think>", re.DOTALL)
  _DETAIL_HIGH = "high"
  
-@@ -257,6 +285,9 @@ class DifyStreamedResponse(StreamedResponse):
+@@ -211,9 +254,16 @@ class DifyLLMAdapterModel(Model[DifyLLMClient]):
+         model_settings: ModelSettings | None,
+         model_request_parameters: ModelRequestParameters,
+     ) -> _DifyRequestInput:
++        model_parameters = _map_model_settings_to_parameters(model_settings)
++        # 与 provider.py 的 gateway 侧 provider_id 归一化保持一致（短名补 plugin_id 成三段）。
++        model_provider = self.model_provider
++        if model_provider.count("/") != 2:
++            model_provider = f"{getattr(self.dify_provider, 'plugin_id', '')}/{model_provider}"
++        if model_provider in _structured_thinking_providers():
++            model_parameters.setdefault(_THINKING_OUTPUT_PARAMETER, _THINKING_OUTPUT_STRUCTURED)
+         return _DifyRequestInput(
+             prompt_messages=_map_messages_to_prompt_messages(messages, model_request_parameters),
+-            model_parameters=_map_model_settings_to_parameters(model_settings),
++            model_parameters=model_parameters,
+             tools=_map_tool_definitions_to_prompt_tools(model_request_parameters),
+             stop_sequences=_get_stop_sequences(model_settings),
+         )
+@@ -257,6 +307,9 @@ class DifyStreamedResponse(StreamedResponse):
          for event in self._embedded_thinking_parser.flush(self._parts_manager, self.provider_name_value):
              yield event
  
@@ -54,7 +87,43 @@ index 1f4c93a16..357ad5a6f 100644
      @property
      def dify_usage(self) -> LLMUsage | None:
          """Return Dify's complete usage for this model request."""
-@@ -706,6 +737,37 @@ def _get_detail(item: ImageUrl | BinaryContent) -> str | None:
+@@ -637,7 +690,34 @@ def _chunk_to_stream_events(
+     events: list[ModelResponseStreamEvent] = []
+     message = chunk.delta.message
+ 
+-    if isinstance(message.content, str):
++    # 结构化模式按 chunk 判定：插件在结构化通路对每个下发 chunk 都携带 reasoning_content
++    # 字段（无思考时为 ""），遗留通路恒为 None。字段存在性即模式信号，无需跨 chunk 状态。
++    reasoning_delta = getattr(chunk.delta, "reasoning_content", None)
++    if reasoning_delta is not None:
++        if reasoning_delta:
++            events.extend(
++                embedded_thinking_parser.emit_structured_thinking(
++                    parts_manager, provider_name, reasoning_delta
++                )
++            )
++        if isinstance(message.content, str):
++            if message.content:
++                events.extend(
++                    parts_manager.handle_text_delta(
++                        vendor_part_id=None, content=message.content, provider_name=provider_name
++                    )
++                )
++        elif isinstance(message.content, list):
++            for part in _map_assistant_content_to_response_parts(message.content):
++                if isinstance(part, TextPart):
++                    events.extend(
++                        parts_manager.handle_text_delta(
++                            vendor_part_id=None, content=part.content, provider_name=provider_name
++                        )
++                    )
++                else:
++                    events.append(parts_manager.handle_part(vendor_part_id=None, part=part))
++    elif isinstance(message.content, str):
+         if message.content:
+             events.extend(embedded_thinking_parser.parse(parts_manager, message.content, provider_name))
+     elif isinstance(message.content, list):
+@@ -706,6 +786,37 @@ def _get_detail(item: ImageUrl | BinaryContent) -> str | None:
      return detail if isinstance(detail, str) else None
  
  
@@ -92,7 +161,7 @@ index 1f4c93a16..357ad5a6f 100644
  def _parse_assistant_text_parts(content: str) -> list[ModelResponsePart]:
      response_parts: list[ModelResponsePart] = []
      cursor = 0
-@@ -731,6 +793,63 @@ def _parse_assistant_text_parts(content: str) -> list[ModelResponsePart]:
+@@ -731,6 +842,72 @@ def _parse_assistant_text_parts(content: str) -> list[ModelResponsePart]:
  class _EmbeddedThinkingParser:
      _pending: str = ""
      _inside_thinking: bool = False
@@ -153,10 +222,19 @@ index 1f4c93a16..357ad5a6f 100644
 +                )
 +            )
 +        return events
++
++    def emit_structured_thinking(
++        self,
++        parts_manager: ModelResponsePartsManager,
++        provider_name: str,
++        content: str,
++    ) -> list[ModelResponseStreamEvent]:
++        """结构化通路的思考增量入口，与标签机共用复读熔断。"""
++        return self._emit_thinking(parts_manager, provider_name, content)
  
      def parse(
          self,
-@@ -748,10 +867,10 @@ class _EmbeddedThinkingParser:
+@@ -748,10 +925,10 @@ class _EmbeddedThinkingParser:
                  if end_index >= 0:
                      if end_index > 0:
                          events.extend(
@@ -171,7 +249,7 @@ index 1f4c93a16..357ad5a6f 100644
                              )
                          )
                      buffer = buffer[end_index + len(_THINK_CLOSE_TAG) :]
-@@ -761,10 +880,10 @@ class _EmbeddedThinkingParser:
+@@ -761,10 +938,10 @@ class _EmbeddedThinkingParser:
                  safe_content, self._pending = _split_incomplete_tag_suffix(buffer, _THINK_CLOSE_TAG)
                  if safe_content:
                      events.extend(
@@ -186,7 +264,7 @@ index 1f4c93a16..357ad5a6f 100644
                          )
                      )
                  break
-@@ -807,12 +926,10 @@ class _EmbeddedThinkingParser:
+@@ -807,12 +984,10 @@ class _EmbeddedThinkingParser:
          pending = self._pending
          self._pending = ""
          if self._inside_thinking:

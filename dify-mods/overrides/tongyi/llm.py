@@ -1,0 +1,1327 @@
+import base64
+import json
+import logging
+import os
+import tempfile
+import uuid
+from collections.abc import Generator
+from http import HTTPStatus
+from pathlib import Path
+from typing import Optional, Union, cast
+
+# isort: off
+import dify_plugin  # noqa: F401 - patches gevent before HTTP SDK imports
+# isort: on
+import openai
+import requests
+from dashscope import Generation, MultiModalConversation, get_tokenizer
+from dashscope.api_entities.dashscope_response import GenerationResponse
+from dashscope.common.error import (
+    AuthenticationError,
+    InvalidParameter,
+    RequestFailure,
+    ServiceUnavailableError,
+    UnsupportedHTTPMethod,
+    UnsupportedModel,
+)
+from dify_plugin.entities.model import (
+    AIModelEntity,
+    FetchFrom,
+    I18nObject,
+    ModelFeature,
+    ModelPropertyKey,
+    ModelType,
+    ParameterRule,
+    ParameterType,
+)
+from dify_plugin.entities.model.llm import (
+    LLMMode,
+    LLMResult,
+    LLMResultChunk,
+    LLMResultChunkDelta,
+)
+from dify_plugin.entities.model.message import (
+    AssistantPromptMessage,
+    AudioPromptMessageContent,
+    DocumentPromptMessageContent,
+    ImagePromptMessageContent,
+    PromptMessage,
+    PromptMessageContentType,
+    PromptMessageRole,
+    PromptMessageTool,
+    SystemPromptMessage,
+    TextPromptMessageContent,
+    ToolPromptMessage,
+    UserPromptMessage,
+    VideoPromptMessageContent,
+)
+from dify_plugin.errors.model import (
+    CredentialsValidateFailedError,
+    InvokeAuthorizationError,
+    InvokeBadRequestError,
+    InvokeConnectionError,
+    InvokeError,
+    InvokeRateLimitError,
+    InvokeServerUnavailableError,
+)
+from dify_plugin.interfaces.model.large_language_model import LargeLanguageModel
+
+from models._common import get_http_base_address
+
+from ..constant import BURY_POINT_HEADER
+from .qwen_long import MAX_DOCUMENT_INPUT_BASE64_BYTES, QwenLongFiles
+
+logger = logging.getLogger(__name__)
+
+
+class TongyiLargeLanguageModel(LargeLanguageModel):
+    tokenizers = {}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._temp_files = []
+
+    def _invoke(
+        self,
+        model: str,
+        credentials: dict,
+        prompt_messages: list[PromptMessage],
+        model_parameters: dict,
+        tools: Optional[list[PromptMessageTool]] = None,
+        stop: Optional[list[str]] = None,
+        stream: bool = True,
+        user: Optional[str] = None,
+    ) -> Union[LLMResult, Generator]:
+        """
+        Invoke large language model
+
+        :param model: model name
+        :param credentials: model credentials
+        :param prompt_messages: prompt messages
+        :param model_parameters: model parameters
+        :param tools: tools for tool calling
+        :param stop: stop words
+        :param stream: is stream response
+        :param user: unique user id
+        :return: full response or stream response chunk generator result
+        """
+        return self._generate(
+            model,
+            credentials,
+            prompt_messages,
+            model_parameters,
+            tools,
+            stop,
+            stream,
+            user,
+        )
+
+    def get_num_tokens(
+        self,
+        model: str,
+        credentials: dict,
+        prompt_messages: list[PromptMessage],
+        tools: Optional[list[PromptMessageTool]] = None,
+    ) -> int:
+        """
+        Get number of tokens for given prompt messages
+
+        :param model: model name
+        :param credentials: model credentials
+        :param prompt_messages: prompt messages
+        :param tools: tools for tool calling
+        :return:
+        """
+        if self.get_customizable_model_schema(model, credentials) is not None:
+            return 0
+        if model in {"qwen-turbo-chat", "qwen-plus-chat"}:
+            model = model.replace("-chat", "")
+        if model == "farui-plus":
+            model = "qwen-farui-plus"
+        if model in self.tokenizers:
+            tokenizer = self.tokenizers[model]
+        else:
+            tokenizer = get_tokenizer(model)
+            self.tokenizers[model] = tokenizer
+        tokens = tokenizer.encode(self._convert_messages_to_prompt(prompt_messages))
+        return len(tokens)
+
+    def validate_credentials(self, model: str, credentials: dict) -> None:
+        """
+        Validate model credentials
+
+        :param model: model name
+        :param credentials: model credentials
+        :return:
+        """
+        try:
+            self._generate(
+                model=model,
+                credentials=credentials,
+                prompt_messages=[UserPromptMessage(content="ping")],
+                model_parameters={"temperature": 0.5},
+                stream=False,
+            )
+        except Exception as ex:
+            raise CredentialsValidateFailedError(str(ex))
+
+    def _generate(
+        self,
+        model: str,
+        credentials: dict,
+        prompt_messages: list[PromptMessage],
+        model_parameters: dict,
+        tools: Optional[list[PromptMessageTool]] = None,
+        stop: Optional[list[str]] = None,
+        stream: bool = True,
+        user: Optional[str] = None,
+    ) -> Union[LLMResult, Generator]:
+        """
+        Invoke large language model
+
+        :param model: model name
+        :param credentials: credentials
+        :param prompt_messages: prompt messages
+        :param tools: tools for tool calling
+        :param model_parameters: model parameters
+        :param stop: stop words
+        :param stream: is stream response
+        :param user: unique user id
+        :return: full response or stream response chunk generator result
+        """
+        credentials_kwargs = self._to_credential_kwargs(credentials)
+        mode = self.get_model_mode(model, credentials)
+        if model in {"qwen-turbo-chat", "qwen-plus-chat"}:
+            model = model.replace("-chat", "")
+        extra_model_kwargs = {}
+        if tools:
+            extra_model_kwargs["tools"] = self._convert_tools(tools)
+        if stop:
+            extra_model_kwargs["stop"] = stop
+
+        response_format = model_parameters.get("response_format")
+        json_schema = model_parameters.pop("json_schema", None)
+        if response_format == "json_schema":
+            if not json_schema:
+                raise ValueError(
+                    "json_schema is required when response_format is json_schema"
+                )
+            if isinstance(json_schema, str):
+                try:
+                    json_schema = json.loads(json_schema)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"Invalid json_schema: {exc}") from exc
+            json_schema = dict(json_schema)
+            strict = json_schema.pop("strict", True)
+            model_parameters["response_format"] = {
+                "type": "json_schema",
+                "json_schema": json_schema,
+                "strict": strict,
+            }
+        elif response_format and not isinstance(response_format, dict):
+            model_parameters["response_format"] = {"type": response_format}
+
+        if model.startswith("qwen-mt"):
+            source_lang = model_parameters.pop("source_lang", None)
+            target_lang = model_parameters.pop("target_lang", None)
+            domains = model_parameters.pop("domains", None)
+            model_parameters["translation_options"] = {
+                "source_lang": source_lang,
+                "target_lang": target_lang,
+                "domains": domains,
+            }
+            # The Qwen-MT model does not support incremental streaming output at this time.
+            stream = False
+            if len(prompt_messages) > 1:
+                prompt_messages = prompt_messages[-1:]
+            if prompt_messages[-1].role != PromptMessageRole.USER:
+                raise ValueError(
+                    "There is one and only one User Message in the messages array."
+                )
+        # For models that support enable_thinking, set a stable default when omitted.
+        # Reference: https://help.aliyun.com/zh/model-studio/deep-thinking
+        thinking_capable_models = {
+            # Qwen Plus/Turbo series (default: thinking disabled, but explicit False ensures consistency)
+            "qwen-plus-latest", "qwen-plus-2025-04-28",
+            "qwen-turbo-latest", "qwen-turbo-2025-04-28",
+            "qwen-flash", "qwen-flash-2025-07-28",
+            # Qwen3 Max, VL Plus/Flash, and Omni Flash series (default: thinking disabled, but explicit False ensures consistency)
+            "qwen3-max-2026-01-23", "qwen3-max-preview",
+            "qwen3-vl-plus", "qwen3-vl-plus-2025-09-23", "qwen3-vl-flash",
+            "qwen3-omni-flash-2025-12-01",
+            # Qwen3.5/3.6/3.7/3.8 series
+            "qwen3.8-max",
+            "qwen3.8-flash",
+            "qwen3.7-max",
+            "qwen3.7-plus", "qwen3.7-plus-2026-05-26",
+            "qwen3.7-flash", "qwen3.7-flash-2026-07-15",
+            "qwen3.6-plus", "qwen3.6-plus-2026-04-02",
+            "qwen3.6-flash", "qwen3.6-flash-2026-04-16",
+            "qwen3.5-plus", "qwen3.5-plus-2026-02-15",
+            "qwen3.5-flash", "qwen3.5-flash-2026-02-23",
+            # GLM series (default: thinking ENABLED - must explicitly disable)
+            "glm-5.1", "glm-5", "glm-4.7", "glm-4.6", "glm-4.5", "glm-4.5-air",
+            # DeepSeek V3 series (default: thinking disabled)
+            "deepseek-v3.2", "deepseek-v3.2-exp", "deepseek-v3.1",
+        }
+        if model in thinking_capable_models and "enable_thinking" not in model_parameters:
+            model_parameters["enable_thinking"] = model == "qwen3.8-max"
+        if model == "qwen3.8-max":
+            if not model_parameters["enable_thinking"]:
+                model_parameters.pop("reasoning_effort", None)
+            elif (temperature := model_parameters.get("temperature")) is not None and temperature < 0.6:
+                # DashScope resets values below 0.6 to 0.6 in thinking mode.
+                model_parameters["temperature"] = 0.6
+            # Dify stores reasoning in content, which preserved thinking rejects.
+            model_parameters["preserve_thinking"] = False
+
+        extra_headers_str = ''
+        if model_parameters.get('extra_headers',''):
+            extra_headers_str = model_parameters.pop('extra_headers')
+
+        # 本地补丁（结构化 thinking 端到端）：dify-agent 在 model_parameters 注入的开关。
+        # 必须在这里剥掉，否则会透传给 DashScope 触发未知参数错误；其他调用方不带此参数，
+        # 沿用原 <think> 标签包装路径，行为零变化。
+        structured_thinking = model_parameters.pop("thinking_output", None) == "structured"
+
+        params = {
+            "model": model,
+            **model_parameters,
+            **credentials_kwargs,
+            **extra_model_kwargs,
+        }
+        model_schema = self.get_model_schema(model, credentials)
+
+        incremental_output = False if tools else stream
+
+        thinking_business_qwen3 = model in (
+            "qwen-plus-latest",
+            "qwen-plus-2025-04-28",
+            "qwen-turbo-latest",
+            "qwen-turbo-2025-04-28",
+            "qwen-flash", "qwen-flash-2025-07-28",
+            "qwen3-max-2026-01-23", "qwen3-max-preview",
+            "qwen3-vl-plus", "qwen3-vl-plus-2025-09-23", "qwen3-vl-flash",
+            "qwen3-omni-flash-2025-12-01",
+            "qwen3.8-max",
+            "qwen3.8-flash",
+            "qwen3.7-max",
+            "qwen3.7-plus", "qwen3.7-plus-2026-05-26",
+            "qwen3.7-flash", "qwen3.7-flash-2026-07-15",
+            "qwen3.6-plus", "qwen3.6-plus-2026-04-02",
+            "qwen3.5-plus", "qwen3.5-plus-2026-02-15",
+            "qwen3.5-flash", "qwen3.5-flash-2026-02-23",
+        ) and model_parameters.get("enable_thinking", False)
+
+        # GLM models with thinking capability (default: thinking enabled)
+        thinking_glm = model in ("glm-5", "glm-4.7", "glm-4.6", "glm-4.5", "glm-4.5-air") \
+                        and model_parameters.get("enable_thinking", False)
+
+        # Kimi models with thinking capability: kimi-k2.5 (when enable_thinking=true) and kimi-k2-thinking
+        thinking_kimi = (
+            model == "kimi-k2.5" and model_parameters.get("enable_thinking", False)
+        ) or model == "kimi-k2-thinking"
+
+        thinking_deepseek_v4 = (
+            model in (
+                "deepseek-v4.1-flash",
+                "deepseek-v4-pro",
+                "deepseek-v4-flash",
+                "deepseek-v4-flash-0731",
+            )
+            and model_parameters.get("enable_thinking", True)
+        )
+
+        # Thinking-mode models that need streamed responses so reasoning_content is preserved.
+        # Note: qwen3-coder-xx, qwen3-max-xx, qwen3-vl-plus/flash, and qwen3.5-xx models support non-streaming output.
+        qwen3_requires_stream = model.startswith("qwen3-") and not model.startswith(
+            ("qwen3-coder", "qwen3-max", "qwen3-vl-plus", "qwen3-vl-flash", "qwen3.5-")
+        )
+        common_force_condition = (
+            thinking_business_qwen3
+            or qwen3_requires_stream
+            or thinking_kimi
+            or thinking_glm
+            or thinking_deepseek_v4
+        )
+        if common_force_condition or model.startswith(("qwq-", "qvq-")):
+            stream = True
+        # Qwen3 business edition (Thinking Mode), Qwen3 open-source edition (excluding coder, max, and VL Plus/Flash variants), QwQ, QVQ, Kimi, and GLM thinking models only supports incremental_output set to True.
+        if common_force_condition or model.startswith(("qwq-", "qvq-")):
+            incremental_output = True
+
+        base_address = get_http_base_address(credentials)
+
+        qwen_long_files = None
+        session = requests.Session()
+        try:
+            if ModelFeature.VISION in (model_schema.features or []):
+                params["messages"] = self._convert_prompt_messages_to_tongyi_messages(
+                    prompt_messages, rich_content=True
+                )
+                response = MultiModalConversation.call(
+                    **params,
+                    stream=stream,
+                    headers=self._build_request_headers(
+                        params["messages"], extra_headers_str, credentials
+                    ),
+                    incremental_output=incremental_output,
+                    base_address=base_address,
+                    session=session,
+                )
+            else:
+                if model.startswith("qwen-long"):
+                    if credentials.get("use_international_endpoint", "false") == "true":
+                        raise InvokeBadRequestError(
+                            "Qwen-Long is only available in the Beijing region."
+                        )
+                    if tools:
+                        raise InvokeBadRequestError("Qwen-Long does not support tools.")
+                    qwen_long_files = QwenLongFiles(
+                        openai.OpenAI(
+                            api_key=credentials["dashscope_api_key"],
+                            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+                            max_retries=0,
+                            timeout=120,
+                        )
+                    )
+                    params["messages"] = self._convert_qwen_long_prompt_messages(
+                        qwen_long_files, prompt_messages
+                    )
+                else:
+                    params["messages"] = (
+                        self._convert_prompt_messages_to_tongyi_messages(
+                            prompt_messages
+                        )
+                    )
+                response = Generation.call(
+                    **params,
+                    headers=self._build_request_headers(
+                        params["messages"], extra_headers_str, credentials
+                    ),
+                    result_format="message",
+                    stream=stream,
+                    incremental_output=incremental_output,
+                    base_address=base_address,
+                    session=session,
+                )
+        except BaseException:
+            if qwen_long_files:
+                qwen_long_files.cleanup()
+            session.close()
+            raise
+
+        if stream:
+            result = self._handle_generate_stream_response(
+                model,
+                credentials,
+                response,
+                prompt_messages,
+                incremental_output,
+                structured_thinking=structured_thinking,
+            )
+            if qwen_long_files:
+                result = self._cleanup_qwen_long_stream(result, qwen_long_files)
+            return self._cleanup_session_stream(result, session)
+        try:
+            return self._handle_generate_response(
+                model, credentials, response, prompt_messages
+            )
+        finally:
+            if qwen_long_files:
+                qwen_long_files.cleanup()
+            session.close()
+
+    @staticmethod
+    def _cleanup_session_stream(result: Generator, session: requests.Session) -> Generator:
+        try:
+            yield from result
+        finally:
+            session.close()
+
+    @staticmethod
+    def _cleanup_qwen_long_stream(
+        result: Generator,
+        files: QwenLongFiles,
+    ) -> Generator:
+        try:
+            yield from result
+        finally:
+            files.cleanup()
+
+    def _handle_generate_response(
+        self,
+        model: str,
+        credentials: dict,
+        response: GenerationResponse,
+        prompt_messages: list[PromptMessage],
+    ) -> LLMResult:
+        """
+        Handle llm response
+
+        :param model: model name
+        :param credentials: credentials
+        :param response: response
+        :param prompt_messages: prompt messages
+        :return: llm response
+        """
+        try:
+            if response.status_code not in {200, HTTPStatus.OK}:
+                # Get request_id (if present) and forward it to the error handler.
+                request_id = getattr(response, "request_id", None)
+                self._handle_error_response(
+                    response.status_code, response.message, model, request_id
+                )
+
+            resp_content = response.output.choices[0].message.content
+            # special for qwen-vl
+            if isinstance(resp_content, list):
+                resp_content = resp_content[0]["text"]
+            assistant_prompt_message = AssistantPromptMessage(
+                content=resp_content,
+                tool_calls=response.output.choices[0].message.get("tool_calls", []),
+            )
+            usage = self._calc_response_usage(
+                model,
+                credentials,
+                response.usage.input_tokens,
+                response.usage.output_tokens,
+            )
+            result = LLMResult(
+                model=model,
+                message=assistant_prompt_message,
+                prompt_messages=prompt_messages,
+                usage=usage,
+            )
+            return result
+        finally:
+            self._cleanup_temp_files()
+
+    def _handle_tool_call_stream(self, response, tool_calls, incremental_output):
+        tool_calls_stream = response.output.choices[0].message["tool_calls"]
+        for tool_call_stream in tool_calls_stream:
+            idx = tool_call_stream.get("index")
+            if idx >= len(tool_calls):
+                tool_calls.append(tool_call_stream)
+            else:
+                if tool_call_stream.get("function"):
+                    func_name = tool_call_stream.get("function").get("name")
+                    tool_call_obj = tool_calls[idx]
+                    if func_name:
+                        if incremental_output:
+                            tool_call_obj["function"]["name"] += func_name
+                        else:
+                            tool_call_obj["function"]["name"] = func_name
+                    args = tool_call_stream.get("function").get("arguments")
+                    if args:
+                        if incremental_output:
+                            tool_call_obj["function"]["arguments"] += args
+                        else:
+                            tool_call_obj["function"]["arguments"] = args
+
+    def _handle_generate_stream_response(
+        self,
+        model: str,
+        credentials: dict,
+        responses: Generator[GenerationResponse, None, None],
+        prompt_messages: list[PromptMessage],
+        incremental_output: bool,
+        structured_thinking: bool = False,
+    ) -> Generator:
+        """
+        Handle llm stream response
+
+        :param model: model name
+        :param credentials: credentials
+        :param responses: response
+        :param prompt_messages: prompt messages
+        :param incremental_output: is incremental output
+        :param structured_thinking: emit native reasoning_content on the chunk delta
+            instead of wrapping it into <think> tags (dify-agent structured path)
+        :return: llm response chunk generator result
+        """
+        is_reasoning = False
+        # This is used to handle unincremental output correctly
+        full_text = ""
+        full_reasoning = ""
+        tool_calls = []
+        try:
+            for index, response in enumerate(responses):
+                if response.status_code not in {200, HTTPStatus.OK}:
+                    # Get request_id (if present) and forward it to the error handler.
+                    request_id = getattr(response, "request_id", None)
+                    self._handle_error_response(
+                        response.status_code, response.message, model, request_id
+                    )
+
+                resp_finish_reason = response.output.choices[0].finish_reason
+                if resp_finish_reason is not None and resp_finish_reason != "null":
+                    resp_content = response.output.choices[0].message.content
+                    assistant_prompt_message = AssistantPromptMessage(content="")
+                    if "tool_calls" in response.output.choices[0].message:
+                        self._handle_tool_call_stream(
+                            response, tool_calls, incremental_output
+                        )
+                    elif resp_content:
+                        if isinstance(resp_content, list):
+                            resp_content = resp_content[0]["text"]
+                        if incremental_output:
+                            assistant_prompt_message.content = resp_content
+                            full_text += resp_content
+                        else:
+                            assistant_prompt_message.content = resp_content.replace(
+                                full_text, "", 1
+                            )
+                            full_text = resp_content
+                    elif is_reasoning:
+                        assistant_prompt_message.content = "\n</think>"
+                        full_text += "\n</think>"
+                    if tool_calls:
+                        message_tool_calls = []
+                        for tool_call_obj in tool_calls:
+                            message_tool_call = AssistantPromptMessage.ToolCall(
+                                id=tool_call_obj["function"]["name"],
+                                type="function",
+                                function=AssistantPromptMessage.ToolCall.ToolCallFunction(
+                                    name=tool_call_obj["function"]["name"],
+                                    arguments=tool_call_obj["function"]["arguments"],
+                                ),
+                            )
+                            message_tool_calls.append(message_tool_call)
+                        assistant_prompt_message.tool_calls = message_tool_calls
+                    usage = response.usage
+                    usage = self._calc_response_usage(
+                        model, credentials, usage.input_tokens, usage.output_tokens
+                    )
+                    reasoning_delta = ""
+                    if structured_thinking:
+                        # 结束块也可能补发最后一段思考；累积模式下 message 为全量，扣除已发前缀。
+                        finish_reasoning = (
+                            response.output.choices[0].message.get("reasoning_content") or ""
+                        )
+                        if isinstance(finish_reasoning, list):
+                            finish_reasoning = "\n".join(map(str, finish_reasoning))
+                        elif not isinstance(finish_reasoning, str):
+                            finish_reasoning = str(finish_reasoning)
+                        if incremental_output:
+                            reasoning_delta = finish_reasoning
+                        elif finish_reasoning.startswith(full_reasoning):
+                            reasoning_delta = finish_reasoning[len(full_reasoning) :]
+                        else:
+                            reasoning_delta = finish_reasoning
+                        full_reasoning = finish_reasoning
+                    yield LLMResultChunk(
+                        model=model,
+                        prompt_messages=prompt_messages,
+                        delta=LLMResultChunkDelta(
+                            index=index,
+                            message=assistant_prompt_message,
+                            finish_reason=resp_finish_reason,
+                            usage=usage,
+                            reasoning_content=reasoning_delta if structured_thinking else None,
+                        ),
+                    )
+                else:
+                    message = response.output.choices[0].message
+
+                    if structured_thinking:
+                        # 本地补丁（结构化 thinking 端到端）：厂商原生 reasoning_content
+                        # 作为独立字段随 chunk 下发，不落 <think> 标签文本。
+                        # 每个下发的 chunk 都带该字段（无思考时为 ""），
+                        # 调用方据此区分结构化模式与遗留标签模式。
+                        reasoning_content = message.get("reasoning_content") or ""
+                        if isinstance(reasoning_content, list):
+                            reasoning_content = "\n".join(map(str, reasoning_content))
+                        elif not isinstance(reasoning_content, str):
+                            reasoning_content = str(reasoning_content)
+                        if incremental_output:
+                            reasoning_delta = reasoning_content
+                        elif reasoning_content.startswith(full_reasoning):
+                            reasoning_delta = reasoning_content[len(full_reasoning) :]
+                        else:
+                            reasoning_delta = reasoning_content
+                        full_reasoning = reasoning_content
+
+                        content = message.get("content") or ""
+                        if isinstance(content, list) and content:
+                            content = content[0].get("text") if isinstance(content[0], dict) else ""
+                        else:
+                            content = str(content)
+                        if incremental_output:
+                            content_delta = content
+                            full_text += content_delta
+                        else:
+                            content_delta = content.replace(full_text, "", 1)
+                            full_text = content
+                        content_to_yield = [content_delta] if content_delta else []
+
+                        if "tool_calls" in message:
+                            self._handle_tool_call_stream(
+                                response, tool_calls, incremental_output
+                            )
+
+                        if content_to_yield or reasoning_delta:
+                            assistant_prompt_message = AssistantPromptMessage(
+                                content="".join(content_to_yield)
+                            )
+                            yield LLMResultChunk(
+                                model=model,
+                                prompt_messages=prompt_messages,
+                                delta=LLMResultChunkDelta(
+                                    index=index,
+                                    message=assistant_prompt_message,
+                                    reasoning_content=reasoning_delta,
+                                ),
+                            )
+                        continue
+
+                    resp_content, is_reasoning = (
+                        self._wrap_thinking_by_reasoning_content(message, is_reasoning)
+                    )
+
+                    content_to_yield = []
+                    if resp_content:
+                        if incremental_output:
+                            delta = resp_content
+                            full_text += delta
+                        else:
+                            delta = resp_content.replace(full_text, "", 1)
+                            full_text = resp_content
+                        content_to_yield.append(delta)
+
+                    if "tool_calls" in message:
+                        if is_reasoning:
+                            content_to_yield.append("\n</think>")
+                            # In incremental mode (stream=True), full_text accumulates the generated content.
+                            # In non-incremental mode, full_text tracks the raw API response state for delta calculation.
+                            # Since "\n</think>" is synthesized locally and not part of the API response,
+                            # we must NOT update full_text in non-incremental mode to avoid sync issues.
+                            if incremental_output:
+                                full_text += "\n</think>"
+                            is_reasoning = False
+                        self._handle_tool_call_stream(
+                            response, tool_calls, incremental_output
+                        )
+
+                    if content_to_yield:
+                        assistant_prompt_message = AssistantPromptMessage(
+                            content="".join(content_to_yield)
+                        )
+                        yield LLMResultChunk(
+                            model=model,
+                            prompt_messages=prompt_messages,
+                            delta=LLMResultChunkDelta(
+                                index=index, message=assistant_prompt_message
+                            ),
+                        )
+        finally:
+            self._cleanup_temp_files()
+
+    def _to_credential_kwargs(self, credentials: dict) -> dict:
+        """
+        Transform credentials to kwargs for model instance
+
+        :param credentials:
+        :return:
+        """
+        credentials_kwargs = {"api_key": credentials["dashscope_api_key"]}
+        return credentials_kwargs
+
+    def _convert_one_message_to_text(self, message: PromptMessage) -> str:
+        """
+        Convert a single message to a string.
+
+        :param message: PromptMessage to convert.
+        :return: String representation of the message.
+        """
+        human_prompt = "\n\nHuman:"
+        ai_prompt = "\n\nAssistant:"
+        content = message.content
+        if isinstance(message, UserPromptMessage):
+            if isinstance(content, str):
+                message_text = f"{human_prompt} {content}"
+            elif isinstance(content, list):
+                message_text = ""
+                for sub_message in content:
+                    if sub_message.type == PromptMessageContentType.TEXT:
+                        message_text = f"{human_prompt} {sub_message.data}"
+                        break
+            else:
+                raise TypeError(
+                    f"[convert_one_message_to_text] Unexpected content type: {type(content)}"
+                )
+        elif isinstance(message, AssistantPromptMessage):
+            message_text = f"{ai_prompt} {content}"
+        elif isinstance(message, SystemPromptMessage | ToolPromptMessage):
+            message_text = content
+        else:
+            raise ValueError(f"Got unknown type {message}")
+        return message_text
+
+    def _convert_messages_to_prompt(self, messages: list[PromptMessage]) -> str:
+        """
+        Format a list of messages into a full prompt for the Anthropic model
+
+        :param messages: List of PromptMessage to combine.
+        :return: Combined string with necessary human_prompt and ai_prompt tags.
+        """
+        messages = messages.copy()
+        text = "".join(
+            (self._convert_one_message_to_text(message) for message in messages)
+        )
+        return text.rstrip()
+
+    def _convert_qwen_long_prompt_messages(
+        self,
+        files: QwenLongFiles,
+        prompt_messages: list[PromptMessage],
+    ) -> list[dict]:
+        normalized_messages: list[
+            tuple[str, str, list[DocumentPromptMessageContent]]
+        ] = []
+        document_count = 0
+        document_base64_bytes = 0
+        index = 0
+
+        while index < len(prompt_messages):
+            prompt_message = prompt_messages[index]
+            if isinstance(prompt_message, SystemPromptMessage):
+                if isinstance(prompt_message.content, list) and any(
+                    not isinstance(content, TextPromptMessageContent)
+                    for content in prompt_message.content
+                ):
+                    raise InvokeBadRequestError(
+                        "Qwen-Long only supports text system messages."
+                    )
+                text = prompt_message.get_text_content().strip()
+                if text:
+                    normalized_messages.append(("system", text, []))
+                index += 1
+                continue
+
+            if isinstance(prompt_message, UserPromptMessage):
+                user_run = []
+                while index < len(prompt_messages) and isinstance(
+                    prompt_messages[index], UserPromptMessage
+                ):
+                    user_run.append(prompt_messages[index])
+                    index += 1
+
+                texts = []
+                documents = []
+                for user_message in user_run:
+                    if isinstance(user_message.content, list):
+                        for content in user_message.content:
+                            if isinstance(content, DocumentPromptMessageContent):
+                                documents.append(content)
+                            elif not isinstance(content, TextPromptMessageContent):
+                                raise InvokeBadRequestError(
+                                    f"Qwen-Long does not support {content.type.value} input."
+                                )
+                    texts.append(user_message.get_text_content().strip())
+
+                question = "\n".join(text for text in texts if text)
+                if not question:
+                    raise InvokeBadRequestError(
+                        "Qwen-Long requires a non-empty text question."
+                    )
+                normalized_messages.append(("user", question, documents))
+                document_count += len(documents)
+                document_base64_bytes += sum(
+                    len(document.base64_data) for document in documents
+                )
+                continue
+
+            if isinstance(prompt_message, AssistantPromptMessage):
+                if isinstance(prompt_message.content, list) and any(
+                    not isinstance(content, TextPromptMessageContent)
+                    for content in prompt_message.content
+                ):
+                    raise InvokeBadRequestError(
+                        "Qwen-Long only supports text assistant messages."
+                    )
+                normalized_messages.append(
+                    ("assistant", prompt_message.get_text_content() or " ", [])
+                )
+                index += 1
+                continue
+
+            if isinstance(prompt_message, ToolPromptMessage):
+                raise InvokeBadRequestError("Qwen-Long does not support tool messages.")
+
+            raise ValueError(f"Got unknown type {prompt_message}")
+
+        if document_count > 100:
+            raise InvokeBadRequestError(
+                "Qwen-Long supports at most 100 documents per request."
+            )
+        if document_base64_bytes > MAX_DOCUMENT_INPUT_BASE64_BYTES:
+            raise InvokeBadRequestError(
+                "Qwen-Long document input exceeds this plugin's aggregate size limit."
+            )
+
+        has_role_definition = bool(
+            normalized_messages
+            and normalized_messages[0][0] == "system"
+            and normalized_messages[0][1]
+        )
+        if document_count and not has_role_definition:
+            normalized_messages.insert(
+                0, ("system", "You are a helpful assistant.", [])
+            )
+
+        messages = []
+        for role, text, documents in normalized_messages:
+            if role == "system" and text:
+                messages.append({"role": "system", "content": text})
+            if documents:
+                file_ids = [
+                    f"fileid://{files.upload(document)}" for document in documents
+                ]
+                messages.append({"role": "system", "content": ",".join(file_ids)})
+            if role != "system":
+                messages.append({"role": role, "content": text})
+
+        files.wait_until_processed()
+        return messages
+
+    def _convert_prompt_messages_to_tongyi_messages(
+        self,
+        prompt_messages: list[PromptMessage],
+        rich_content: bool = False,
+    ) -> list[dict]:
+        """
+        Convert prompt messages to tongyi messages
+
+        :param prompt_messages: prompt messages
+        :return: tongyi messages
+        """
+        tongyi_messages = []
+        for prompt_message in prompt_messages:
+            if isinstance(prompt_message, SystemPromptMessage):
+                tongyi_messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            prompt_message.content
+                            if not rich_content
+                            else [{"text": prompt_message.content}]
+                        ),
+                    }
+                )
+            elif isinstance(prompt_message, UserPromptMessage):
+                if isinstance(prompt_message.content, str):
+                    tongyi_messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                prompt_message.content
+                                if not rich_content
+                                else [{"text": prompt_message.content}]
+                            ),
+                        }
+                    )
+                else:
+                    user_messages = []
+                    for message_content in prompt_message.content:
+                        if message_content.type == PromptMessageContentType.TEXT:
+                            message_content = cast(
+                                TextPromptMessageContent, message_content
+                            )
+                            sub_message_dict = {"text": message_content.data}
+                            user_messages.append(sub_message_dict)
+                        elif message_content.type == PromptMessageContentType.IMAGE:
+                            message_content = cast(
+                                ImagePromptMessageContent, message_content
+                            )
+                            image_url = message_content.data
+                            if message_content.data.startswith("data:"):
+                                image_url = self._save_base64_to_file(
+                                    message_content.data
+                                )
+                            sub_message_dict = {"image": image_url}
+                            user_messages.append(sub_message_dict)
+                        elif message_content.type == PromptMessageContentType.VIDEO:
+                            message_content = cast(
+                                VideoPromptMessageContent, message_content
+                            )
+                            video_url = message_content.data
+                            if message_content.data.startswith("data:"):
+                                video_url = self._save_base64_to_file(
+                                    message_content.data
+                                )
+                            sub_message_dict = {"video": video_url}
+                            user_messages.append(sub_message_dict)
+                        elif message_content.type == PromptMessageContentType.AUDIO:
+                            message_content = cast(
+                                AudioPromptMessageContent, message_content
+                            )
+                            audio_data = message_content.data
+                            if not audio_data:
+                                raise ValueError("Audio content cannot be empty.")
+                            if audio_data.startswith("data:"):
+                                audio_data = self._save_base64_to_file(audio_data)
+                            sub_message_dict = {"audio": audio_data}
+                            user_messages.append(sub_message_dict)
+                    user_messages = sorted(user_messages, key=lambda x: "text" in x)
+                    tongyi_messages.append({"role": "user", "content": user_messages})
+            elif isinstance(prompt_message, AssistantPromptMessage):
+                content = prompt_message.content
+                if not content:
+                    content = " "
+                message = {
+                    "role": "assistant",
+                    "content": content if not rich_content else [{"text": content}],
+                }
+                if prompt_message.tool_calls:
+                    message["tool_calls"] = [
+                        tool_call.model_dump()
+                        for tool_call in prompt_message.tool_calls
+                    ]
+                tongyi_messages.append(message)
+            elif isinstance(prompt_message, ToolPromptMessage):
+                tongyi_messages.append(
+                    {
+                        "role": "tool",
+                        "content": prompt_message.content,
+                        "name": prompt_message.tool_call_id,
+                    }
+                )
+            else:
+                raise ValueError(f"Got unknown type {prompt_message}")
+        return tongyi_messages
+
+    def _save_base64_to_file(self, base64_data: str) -> str:
+        """
+        Save base64 data to file
+        'data:{upload_file.mime_type};base64,{encoded_string}'
+
+        :param base64_data: base64 data
+        :return: file path
+        """
+        (mime_type, encoded_string) = (
+            base64_data.split(",")[0].split(";")[0].split(":")[1],
+            base64_data.split(",")[1],
+        )
+        temp_dir = tempfile.gettempdir()
+        file_path = os.path.join(temp_dir, f"{uuid.uuid4()}.{mime_type.split('/')[1]}")
+        Path(file_path).write_bytes(base64.b64decode(encoded_string))
+        self._temp_files.append(file_path)
+        return f"file://{file_path}"
+
+    def _cleanup_temp_files(self):
+        """Clean up temporary files"""
+        for file_path in self._temp_files:
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            except Exception as e:
+                logger.warning(f"Failed to remove temporary file {file_path}: {e}")
+        self._temp_files.clear()
+
+    def _convert_tools(self, tools: list[PromptMessageTool]) -> list[dict]:
+        """
+        Convert tools
+        """
+        tool_definitions = []
+        for tool in tools:
+            properties = tool.parameters.get("properties", {})
+            required_properties = tool.parameters.get("required", [])
+            properties_definitions = {}
+            for p_key, p_val in properties.items():
+                desc = p_val.get("description") or ""
+                if "enum" in p_val:
+                    desc += f"; Only accepts one of the following predefined options: [{', '.join(p_val['enum'])}]"
+                properties_definitions[p_key] = {
+                    "description": desc,
+                    # A property may legally declare no type (anyOf/oneOf/$ref/const);
+                    # omit the key rather than inventing one.
+                    **({"type": p_val["type"]} if "type" in p_val else {}),
+                }
+            tool_definition = {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": properties_definitions,
+                    "required": required_properties,
+                },
+            }
+            tool_definitions.append(tool_definition)
+        return tool_definitions
+
+    def _wrap_thinking_by_reasoning_content(
+        self, delta: dict, is_reasoning: bool
+    ) -> tuple[str, bool]:
+        """
+        If the reasoning response is from delta.get("reasoning_content"), we wrap
+        it with HTML think tag.
+        :param delta: delta dictionary from LLM streaming response
+        :param is_reasoning: is reasoning
+        :return: tuple of (processed_content, is_reasoning)
+        """
+
+        content = delta.get("content") or ""
+        if isinstance(content, list) and content:
+            content = content[0].get("text") if isinstance(content[0], dict) else ""
+        else:
+            content = str(content)
+        reasoning_content = delta.get("reasoning_content") or ""
+        try:
+            if isinstance(reasoning_content, list):
+                reasoning_content = "\n".join(map(str, reasoning_content))
+            elif not isinstance(reasoning_content, str):
+                reasoning_content = str(reasoning_content)
+
+            output = ""
+            if reasoning_content:
+                if not is_reasoning:
+                    # Open a think block on first reasoning token
+                    output += f"<think>\n{reasoning_content}"
+                    is_reasoning = True
+                else:
+                    # Continue streaming inside the think block
+                    output += reasoning_content
+
+            if is_reasoning:
+                if not reasoning_content and not content:
+                    # No reasoning or content token, close the think block
+                    is_reasoning = False
+                    output += "\n</think>"
+                # Handle edge case: both reasoning_content and content are non-empty
+                # in the same chunk (DashScope/Bailian API occasionally does this at
+                # the transition boundary between reasoning and content phases)
+                if content:
+                    is_reasoning = False
+                    output += f"\n</think>{content}"
+            elif content:
+                # No reasoning token and not in a reasoning block
+                output += content
+        except Exception as ex:
+            raise ValueError(f"[wrap_thinking_by_reasoning_content] {ex}") from ex
+        return output, is_reasoning
+
+    def _handle_error_response(
+        self, status_code: int, message: str, model: str = None, request_id: str = None
+    ) -> None:
+        """
+        Handle error response based on HTTP status code
+
+        :param status_code: HTTP status code
+        :param message: error message
+        :param model: model name (optional, for more detailed error messages)
+        :param request_id: request id from Tongyi API response (optional)
+        :raises: Appropriate InvokeError based on status code
+        """
+        if model:
+            error_msg = f"Failed to invoke model {model}, status code: {status_code}, message: {message}"
+        else:
+            error_msg = message
+
+        if request_id:
+            error_msg += f", request_id: {request_id}"
+
+        if status_code == 400:
+            raise InvokeBadRequestError(error_msg)
+        elif status_code == 401:
+            raise InvokeAuthorizationError(error_msg)
+        elif status_code == 403:
+            raise InvokeAuthorizationError(error_msg)
+        elif status_code == 422:
+            raise InvokeBadRequestError(error_msg)
+        elif status_code == 429:
+            raise InvokeRateLimitError(error_msg)
+        elif status_code >= 500:
+            raise InvokeServerUnavailableError(error_msg)
+        else:
+            # For any other 4xx errors, treat as bad request
+            if 400 <= status_code < 500:
+                raise InvokeBadRequestError(error_msg)
+            # For any other status codes, treat as server unavailable
+            else:
+                raise InvokeServerUnavailableError(error_msg)
+
+    def _transform_invoke_error(self, error: Exception) -> InvokeError:
+        if isinstance(error, InvokeError):
+            return error
+        return super()._transform_invoke_error(error)
+
+    @property
+    def _invoke_error_mapping(self) -> dict[type[InvokeError], list[type[Exception]]]:
+        """
+        Map model invoke error to unified error
+        The key is the error type thrown to the caller
+        The value is the error type thrown by the model,
+        which needs to be converted into a unified error type for the caller.
+
+        :return: Invoke error mapping
+        """
+        return {
+            InvokeServerUnavailableError: [
+                ServiceUnavailableError,
+                openai.InternalServerError,
+            ],
+            InvokeConnectionError: [
+                RequestFailure,
+                openai.APIConnectionError,
+                openai.APITimeoutError,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+            ],
+            InvokeRateLimitError: [openai.RateLimitError],
+            InvokeAuthorizationError: [
+                AuthenticationError,
+                openai.AuthenticationError,
+                openai.PermissionDeniedError,
+            ],
+            InvokeBadRequestError: [
+                InvalidParameter,
+                UnsupportedModel,
+                UnsupportedHTTPMethod,
+                openai.BadRequestError,
+                openai.NotFoundError,
+                openai.UnprocessableEntityError,
+                openai.APIError,
+            ],
+        }
+
+    def get_customizable_model_schema(
+        self, model: str, credentials: dict
+    ) -> Optional[AIModelEntity]:
+        """
+        Architecture for defining customizable models
+
+        :param model: model name
+        :param credentials: model credentials
+        :return: AIModelEntity or None
+        """
+        return AIModelEntity(
+            model=model,
+            label=I18nObject(en_us=model, zh_hans=model),
+            model_type=ModelType.LLM,
+            features=(
+                [
+                    ModelFeature.TOOL_CALL,
+                    ModelFeature.MULTI_TOOL_CALL,
+                    ModelFeature.STREAM_TOOL_CALL,
+                ]
+                if credentials.get("function_calling_type") == "tool_call"
+                else []
+            ),
+            fetch_from=FetchFrom.CUSTOMIZABLE_MODEL,
+            model_properties={
+                ModelPropertyKey.CONTEXT_SIZE: int(
+                    credentials.get("context_size", 8000)
+                ),
+                ModelPropertyKey.MODE: LLMMode.CHAT.value,
+            },
+            parameter_rules=[
+                ParameterRule(
+                    name="temperature",
+                    use_template="temperature",
+                    label=I18nObject(en_us="Temperature", zh_hans="温度"),
+                    type=ParameterType.FLOAT,
+                ),
+                ParameterRule(
+                    name="max_tokens",
+                    use_template="max_tokens",
+                    default=512,
+                    min=1,
+                    max=int(credentials.get("max_tokens", 1024)),
+                    label=I18nObject(en_us="Max Tokens", zh_hans="最大标记"),
+                    type=ParameterType.INT,
+                ),
+                ParameterRule(
+                    name="top_p",
+                    use_template="top_p",
+                    label=I18nObject(en_us="Top P", zh_hans="Top P"),
+                    type=ParameterType.FLOAT,
+                ),
+                ParameterRule(
+                    name="top_k",
+                    use_template="top_k",
+                    label=I18nObject(en_us="Top K", zh_hans="Top K"),
+                    type=ParameterType.FLOAT,
+                ),
+                ParameterRule(
+                    name="frequency_penalty",
+                    use_template="frequency_penalty",
+                    label=I18nObject(en_us="Frequency Penalty", zh_hans="重复惩罚"),
+                    type=ParameterType.FLOAT,
+                ),
+            ],
+        )
+
+    def _get_market_bury_point_header(self, messages: list[dict], extra_headers_str: str) -> dict:
+        """
+        Extract market bury point header information from messages
+
+        This function parses system role messages in the messages list to extract productCode and buyerUid,
+        constructs the bury point header, and cleans up the marketParams tag content from the original message.
+
+        Args:
+            messages (list[dict]): Message list, each element contains role and content fields
+
+        Returns:
+            dict: Bury point header information dictionary containing moduleCode, accountId and other fields;
+                  If no valid information can be extracted, returns the default BURY_POINT_HEADER
+        """
+        res_bury_point_header = {}
+        system_entries = [entry for entry in messages if entry["role"] == "system"]
+        if system_entries:
+            system_entry = system_entries[0].get("content", "")
+            if system_entry:
+                try:
+                    system_entry_split = system_entry.split("||||||")
+                    if len(system_entry_split) >= 2:
+                        burn = system_entry_split[0].split(",")
+                        bury_point_header = json.loads(
+                            BURY_POINT_HEADER.get("x-dashscope-euid")
+                        )
+                        if len(burn) in (1, 2):
+                            product_code = burn[0]
+                            buyer_uid = burn[1] if len(burn) == 2 else ""
+                            bury_point_header["moduleCode"] = product_code.strip()
+                            bury_point_header["accountId"] = buyer_uid.strip()
+
+                        system_entries[0]["content"] = "".join(system_entry_split[1:])
+                        res_bury_point_header = {"x-dashscope-euid": json.dumps(bury_point_header)}
+                except Exception:
+                    res_bury_point_header = {}
+
+        if extra_headers_str and res_bury_point_header == {}:
+            try:
+                # Replace non-breaking spaces and other special whitespace characters with regular spaces
+                cleaned_str = extra_headers_str.replace('\xa0', ' ').replace('\u3000', ' ')
+                res_bury_point_header = json.loads(cleaned_str)
+            except Exception:
+                res_bury_point_header = {}
+
+        return res_bury_point_header
+
+    def _build_request_headers(
+        self,
+        messages: list[dict],
+        extra_headers_str: str,
+        credentials: dict,
+    ) -> dict:
+        """Compose the request headers for a DashScope call.
+
+        Combines the bury-point header produced by
+        ``_get_market_bury_point_header`` (DashScope-platform analytics)
+        with the Dify request-metadata headers produced by
+        ``apply_dify_headers_if_enabled`` (Dify-platform telemetry).
+        Centralizing the merge here keeps the contract in one place so
+        the two DashScope call sites in ``_generate`` (vision and text)
+        stay in sync and the helper does not need to be re-derived by
+        future contributors.
+
+        The Dify keys take precedence on collision; see
+        ``_metadata.apply_dify_headers_if_enabled`` for the
+        case-insensitive precedence rules. Returns a new dict; the
+        caller's headers reference (if any) is never mutated.
+        """
+        from ._metadata import apply_dify_headers_if_enabled
+
+        bury_point = self._get_market_bury_point_header(messages, extra_headers_str)
+        return apply_dify_headers_if_enabled(bury_point, credentials)

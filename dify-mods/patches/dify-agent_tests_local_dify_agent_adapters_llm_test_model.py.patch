@@ -1,0 +1,197 @@
+diff --git a/dify-agent/tests/local/dify_agent/adapters/llm/test_model.py b/dify-agent/tests/local/dify_agent/adapters/llm/test_model.py
+index eb6df3820..665dc4dcf 100644
+--- a/dify-agent/tests/local/dify_agent/adapters/llm/test_model.py
++++ b/dify-agent/tests/local/dify_agent/adapters/llm/test_model.py
+@@ -1,5 +1,6 @@
+ import asyncio
+ import json
++import os
+ import unittest
+ from contextlib import asynccontextmanager
+ from decimal import Decimal
+@@ -55,6 +56,7 @@ class DifyLLMAdapterModelTests(unittest.IsolatedAsyncioTestCase):
+     def make_provider(
+         self,
+         *,
++        plugin_id: str = "langgenius/openai",
+         user_id: str = "user-123",
+         http_client: httpx.AsyncClient | None = None,
+     ) -> DifyApiLLMProvider:
+@@ -62,7 +64,7 @@ class DifyLLMAdapterModelTests(unittest.IsolatedAsyncioTestCase):
+             http_client = httpx.AsyncClient(trust_env=False)
+             self._http_clients.append(http_client)
+         return DifyApiLLMProvider(
+-            plugin_id="langgenius/openai",
++            plugin_id=plugin_id,
+             inner_api_url="http://dify-api",
+             inner_api_key="inner-secret",
+             execution_context=DifyExecutionContextLayerConfig(
+@@ -839,6 +841,168 @@ class DifyLLMAdapterModelTests(unittest.IsolatedAsyncioTestCase):
+ 
+         self.assertEqual(str(context.exception), "missing endpoint config")
+ 
++    async def test_request_stream_structured_reasoning_bypasses_tag_parsing(self) -> None:
++        def handler(request: httpx.Request) -> httpx.Response:
++            payload = json.loads(request.content.decode("utf-8"))
++            self.assertEqual(payload["target"]["model_parameters"].get("thinking_output"), "structured")
++            return build_stream_response(
++                LLMResultChunk(
++                    model="demo-model",
++                    delta=LLMResultChunkDelta(
++                        index=0,
++                        message=AssistantPromptMessage(content="", tool_calls=[]),
++                        reasoning_content="先想一步。",
++                    ),
++                ),
++                LLMResultChunk(
++                    model="demo-model",
++                    delta=LLMResultChunkDelta(
++                        index=1,
++                        message=AssistantPromptMessage(content="最终答案，无标签。", tool_calls=[]),
++                        reasoning_content="",
++                    ),
++                ),
++                LLMResultChunk(
++                    model="demo-model",
++                    delta=LLMResultChunkDelta(
++                        index=2,
++                        message=AssistantPromptMessage(content="", tool_calls=[]),
++                        usage=make_usage(prompt_tokens=6, completion_tokens=4),
++                        finish_reason="stop",
++                        reasoning_content="",
++                    ),
++                ),
++            )
++
++        async with self.mock_gateway_stream(httpx.MockTransport(handler)):
++            with patch.dict(os.environ, {"DIFY_AGENT_STRUCTURED_THINKING_PROVIDERS": "langgenius/openai/openai"}):
++                adapter = DifyLLMAdapterModel(
++                    "demo-model",
++                    self.make_provider(),
++                    model_provider="openai",
++                )
++
++                async with adapter.request_stream(
++                    [ModelRequest(parts=[UserPromptPart("hello")])],
++                    model_settings=None,
++                    model_request_parameters=ModelRequestParameters(),
++                ) as stream:
++                    events = [event async for event in stream]
++                    response = stream.get()
++
++        self.assertTrue(events)
++        self.assertEqual([part.part_kind for part in response.parts], ["thinking", "text"])
++        self.assertEqual(cast(ThinkingPart, response.parts[0]).content, "先想一步。")
++        self.assertEqual(cast(TextPart, response.parts[1]).content, "最终答案，无标签。")
++
++    async def test_request_stream_structured_reasoning_with_tool_calls(self) -> None:
++        def handler(_request: httpx.Request) -> httpx.Response:
++            return build_stream_response(
++                LLMResultChunk(
++                    model="demo-model",
++                    delta=LLMResultChunkDelta(
++                        index=0,
++                        message=AssistantPromptMessage(content="", tool_calls=[]),
++                        reasoning_content="查一下天气。",
++                    ),
++                ),
++                LLMResultChunk(
++                    model="demo-model",
++                    delta=LLMResultChunkDelta(
++                        index=1,
++                        message=AssistantPromptMessage(
++                            content="",
++                            tool_calls=[
++                                AssistantPromptMessage.ToolCall(
++                                    id="call-1",
++                                    type="function",
++                                    function=AssistantPromptMessage.ToolCall.ToolCallFunction(
++                                        name="weather",
++                                        arguments='{"city":"Paris"}',
++                                    ),
++                                )
++                            ],
++                        ),
++                        reasoning_content="",
++                    ),
++                ),
++                LLMResultChunk(
++                    model="demo-model",
++                    delta=LLMResultChunkDelta(
++                        index=2,
++                        message=AssistantPromptMessage(content="", tool_calls=[]),
++                        usage=make_usage(prompt_tokens=6, completion_tokens=4),
++                        finish_reason="tool_calls",
++                        reasoning_content="",
++                    ),
++                ),
++            )
++
++        async with self.mock_gateway_stream(httpx.MockTransport(handler)):
++            with patch.dict(os.environ, {"DIFY_AGENT_STRUCTURED_THINKING_PROVIDERS": "langgenius/openai/openai"}):
++                adapter = DifyLLMAdapterModel(
++                    "demo-model",
++                    self.make_provider(),
++                    model_provider="openai",
++                )
++
++                async with adapter.request_stream(
++                    [ModelRequest(parts=[UserPromptPart("hello")])],
++                    model_settings=None,
++                    model_request_parameters=ModelRequestParameters(),
++                ) as stream:
++                    events = [event async for event in stream]
++                    response = stream.get()
++
++        self.assertTrue(events)
++        self.assertEqual([part.part_kind for part in response.parts], ["thinking", "tool-call"])
++        self.assertEqual(cast(ThinkingPart, response.parts[0]).content, "查一下天气。")
++        self.assertEqual(cast(ToolCallPart, response.parts[1]).tool_name, "weather")
++        self.assertEqual(response.finish_reason, "tool_call")
++
++    async def test_request_injects_structured_thinking_marker_for_default_tongyi_allowlist(self) -> None:
++        def handler(request: httpx.Request) -> httpx.Response:
++            payload = json.loads(request.content.decode("utf-8"))
++            self.assertEqual(payload["target"]["provider"], "langgenius/tongyi/tongyi")
++            self.assertEqual(payload["target"]["model_parameters"].get("thinking_output"), "structured")
++            return build_stream_response(*single_text_chunk("ok"))
++
++        async with self.mock_gateway_stream(httpx.MockTransport(handler)):
++            with patch.dict(os.environ, {"DIFY_AGENT_STRUCTURED_THINKING_PROVIDERS": ""}):
++                adapter = DifyLLMAdapterModel(
++                    "demo-model",
++                    self.make_provider(plugin_id="langgenius/tongyi"),
++                    model_provider="tongyi",
++                )
++
++                await adapter.request(
++                    [ModelRequest(parts=[UserPromptPart("hello")])],
++                    model_settings=None,
++                    model_request_parameters=ModelRequestParameters(),
++                )
++
++    async def test_request_omits_structured_thinking_marker_for_unlisted_providers(self) -> None:
++        def handler(request: httpx.Request) -> httpx.Response:
++            payload = json.loads(request.content.decode("utf-8"))
++            self.assertNotIn("thinking_output", payload["target"]["model_parameters"])
++            return build_stream_response(*single_text_chunk("plain"))
++
++        async with self.mock_gateway_stream(httpx.MockTransport(handler)):
++            with patch.dict(os.environ, {"DIFY_AGENT_STRUCTURED_THINKING_PROVIDERS": "langgenius/tongyi/tongyi"}):
++                adapter = DifyLLMAdapterModel(
++                    "demo-model",
++                    self.make_provider(),
++                    model_provider="openai",
++                )
++
++                response = await adapter.request(
++                    [ModelRequest(parts=[UserPromptPart("hello")])],
++                    model_settings=None,
++                    model_request_parameters=ModelRequestParameters(),
++                )
++
++        self.assertEqual(cast(TextPart, response.parts[0]).content, "plain")
++
+ 
+ @pytest.mark.parametrize(
+     "part",
