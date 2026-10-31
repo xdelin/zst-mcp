@@ -85,11 +85,11 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP("PPT Evaluation Service")
 
 # 后端 API 地址 (默认本地) - 用于生成外部访问链接
-API_BASE = os.getenv("API_BASE_URL", "http://<old-server-ip>")
+API_BASE = os.getenv("API_BASE_URL", "")
 # 内部 API 地址 (用于 Docker 容器间通信) - 默认为 API_BASE
 INTERNAL_API_BASE = os.getenv("INTERNAL_API_BASE_URL", "http://127.0.0.1:6801")
 # Dify 平台地址 - 用于补全 Dify 文件相对路径
-DIFY_BASE_URL = os.getenv("DIFY_BASE_URL", "http://<internal-host>")
+DIFY_BASE_URL = os.getenv("DIFY_BASE_URL", "")
 
 # 报告保存目录 (wpss-backend/main_api/reports，由 6801 服务静态托管)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -415,15 +415,6 @@ def process_pdf(file_path: str) -> tuple[List[Dict], List[str]]:
     return slides_data, screenshots
 
 
-def _encode_local_image_to_data_url(file_path: str) -> str:
-    """将本地图片转成 data URL"""
-    ext = os.path.splitext(file_path)[1].lower()
-    mime_type = "image/png" if ext == ".png" else "image/jpeg"
-    with open(file_path, "rb") as img_file:
-        encoded = base64.b64encode(img_file.read()).decode("utf-8")
-    return f"data:{mime_type};base64,{encoded}"
-
-
 def _extract_text_from_word(file_path: str) -> str:
     """提取 DOCX/DOC 文本（Windows 优先）"""
     ext = os.path.splitext(file_path)[1].lower()
@@ -456,25 +447,20 @@ def _extract_text_from_word(file_path: str) -> str:
     return ""
 
 
-def _extract_evidence(file_path: str) -> tuple[str, List[str]]:
+def _extract_evidence(file_path: str) -> str:
     """
-    解析证据文件，返回：(证据文本, 证据图片列表data-url)
-    支持：图片 / PDF / DOCX / DOC
+    解析证据文件，返回证据文本。证据进入评审的唯一通道是文本（注入每页分析提示词）。
+    支持：PDF / DOCX / DOC；图片类证据不参与评审，返回说明文本。
     """
     if not file_path or not os.path.exists(file_path):
-        return "", []
+        return ""
 
     ext = os.path.splitext(file_path)[1].lower()
-    evidence_text = ""
-    evidence_images: List[str] = []
 
     if ext in [".png", ".jpg", ".jpeg"]:
-        evidence_images.append(_encode_local_image_to_data_url(file_path))
-        evidence_text = "[证据文件] 用户上传了原始图像作为评价依据，请结合该图像进行判断。"
-        return evidence_text, evidence_images
+        return "[证据文件] 用户上传了图片类参考资料，当前对照评审仅支持文本类证据（.pdf/.docx/.doc），图片内容未参与评审，建议改用文档类参考资料。"
 
     if ext == ".pdf":
-        # PDF 既提取文本，也提取页面截图（限制页数，防止 token 过大）
         try:
             doc = fitz.open(file_path)
             text_chunks = []
@@ -482,26 +468,16 @@ def _extract_evidence(file_path: str) -> tuple[str, List[str]]:
                 page_text = page.get_text() or ""
                 if page_text.strip():
                     text_chunks.append(page_text)
-            evidence_text = "\n".join(text_chunks).strip()
-
-            # 最多附带前 5 页截图作为证据图像
-            for idx, page in enumerate(doc):
-                if idx >= 5:
-                    break
-                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                img_bytes = pix.tobytes("png")
-                b64 = base64.b64encode(img_bytes).decode("utf-8")
-                evidence_images.append(f"data:image/png;base64,{b64}")
             doc.close()
+            return "\n".join(text_chunks).strip()
         except Exception as e:
             logger.error(f"PDF evidence parse failed: {e}")
-        return evidence_text, evidence_images
+            return ""
 
     if ext in [".docx", ".doc"]:
-        evidence_text = _extract_text_from_word(file_path)
-        return evidence_text, evidence_images
+        return _extract_text_from_word(file_path)
 
-    return "", []
+    return ""
 
 
 async def _call_ai_chat_stream(payload: Dict[str, Any]) -> str:
@@ -600,7 +576,7 @@ async def evaluate_ppt_with_evidence(
 
     Args:
         ppt_file_path: 待评价 PPT 文件的本地路径/URL（仅支持 .pptx/.pdf）
-        evidence_file_path: 可选，参考资料的本地路径/URL（支持.png/.jpg/.jpeg/.pdf/.docx/.doc）
+        evidence_file_path: 可选，参考资料的本地路径/URL（支持 .pdf/.docx/.doc 文本类证据；图片类文件不参与评审，建议提供文档类资料）
         user_query: 可选，用户自定义评价要求
     """
     logger.info(
@@ -635,7 +611,6 @@ async def evaluate_ppt_with_evidence(
 
     # 2) 解析证据文件（可选）
     evidence_text = ""
-    evidence_images: List[str] = []
     if evidence_file_path:
         try:
             evidence_file_path = await download_to_temp(evidence_file_path, "evidence")
@@ -643,22 +618,17 @@ async def evaluate_ppt_with_evidence(
             return f"Error downloading evidence file: {str(e)}"
         if not os.path.exists(evidence_file_path):
             return f"Error: evidence_file_path not found at {evidence_file_path}"
-        evidence_text, evidence_images = _extract_evidence(evidence_file_path)
+        evidence_text = _extract_evidence(evidence_file_path)
 
-    # 3) 构造请求 —— PPT截图和参考文献通过索引严格区分
+    # 3) 构造请求 —— 证据只走文本通道：文献文本注入提示词，被评对象只有 PPT 截图
     ppt_count = len(screenshots)
-    merged_screenshots = screenshots[:]  # PPT截图在前
+    merged_screenshots = screenshots[:]
 
     extra_note = ""
     if evidence_text:
         clipped = evidence_text[:8000]
         extra_note += f"\n\n[参考文献/资料文本]\n{clipped}"
-    if evidence_images:
-        # 将参考文献图片追加到末尾，但明确告诉模型索引范围
-        merged_screenshots.extend(evidence_images)
-        extra_note += f"\n\n【重要：图片索引说明】截图编号 1~{ppt_count} 是PPT页面（需要评价和标注的对象），编号 {ppt_count+1}~{ppt_count+len(evidence_images)} 是参考文献/资料图片（仅作为评价依据，不要对其进行视觉分析或问题标注）。"
-    if extra_note:
-        extra_note += f"\n\n请严格区分：只对前 {ppt_count} 张PPT截图进行视觉问题分析和标注框绘制，参考文献仅用于对比验证PPT内容的准确性。"
+        extra_note += "\n\n参考文献文本仅用于核对PPT内容陈述是否与资料一致：评审结论必须基于PPT截图本身，文献中出现而PPT中没有的内容不得当作PPT的优点或问题来评价。"
 
     payload = {
         "message": f"{user_query}{extra_note}",
